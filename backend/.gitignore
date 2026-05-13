@@ -1,0 +1,10 @@
+.env
+.env.*
+node_modules/
+dist/
+
+# Persistent data — contains sensitive info, never commit
+data/hospitals.json
+data/hospitals.json.tmp
+data/patientEmails.json
+data/patientEmails.json.tmp
