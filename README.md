@@ -149,10 +149,17 @@ npm run start:prod   # runs node dist/server.js
 
 ### Database persistence
 
-The following files are persisted to `backend/data/`:
+This system uses **PostgreSQL** for persistent storage of:
 
-- `hospitals.json` — registered hospital accounts
-- `patientEmails.json` — patient ID → email mapping (used for authorization requests)
+- Hospital accounts — registered hospital nodes
+- Patient email mappings — patient ID → email (used for authorization requests)
+
+Both are stored in a PostgreSQL database configured via the `DATABASE_URL`
+environment variable.
+
+**Local development:** Install PostgreSQL, create a database called
+`clinical_ledger`, and set:
+
 
 Both files are created automatically on first run and excluded from git.
 
