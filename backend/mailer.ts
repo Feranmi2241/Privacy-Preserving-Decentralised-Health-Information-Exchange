@@ -14,14 +14,21 @@ import nodemailer from "nodemailer";
 function getTransporter(): nodemailer.Transporter {
   const user = process.env.EMAIL_USER;
   const pass = process.env.EMAIL_PASS;
+
   if (!user || !pass) {
-    throw new Error(
-      "EMAIL_USER and EMAIL_PASS must be set in .env to send emails"
-    );
+    throw new Error("EMAIL_USER and EMAIL_PASS must be set in the environment to send emails");
   }
+
   return nodemailer.createTransport({
-    service: "gmail",
-    auth: { user, pass },
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true, // true for 465, false for other ports
+    auth: {
+      user: user,
+      pass: pass,
+    },
+    // Optional: Add a short timeout threshold so it fails fast instead of hanging
+    connectionTimeout: 10000, // 10 seconds
   });
 }
 
