@@ -71,6 +71,8 @@ import { signToken, verifyToken, STRONG_PASSWORD_REGEX } from "./auth";
 
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app  = express();
+app.set('trust proxy', 1);
+
 const PORT = parseInt(process.env.PORT || "5000", 10);
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "http://localhost:5173";
 
@@ -157,6 +159,10 @@ app.post("/auth/verify-otp", otpLimiter, async (req: Request, res: Response) => 
   await markVerified(email);
   res.json({ message: "Email verified" });
 });
+app.set('trust proxy', 1);
+app.set('trust proxy', 1);
+app.set('trust proxy', 1);
+app.set('trust proxy', 1);
 
 // ── POST /auth/login ──────────────────────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req: Request, res: Response) => {

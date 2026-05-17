@@ -19,18 +19,13 @@ function getTransporter(): nodemailer.Transporter {
     throw new Error("EMAIL_USER and EMAIL_PASS must be set in the environment to send emails");
   }
 
-  return nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true, // true for 465, false for other ports
-    auth: {
-      user: user,
-      pass: pass,
-    },
-    // Optional: Add a short timeout threshold so it fails fast instead of hanging
-    connectionTimeout: 10000, // 10 seconds
-  });
-}
+return nodemailer.createTransport({
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true,
+  auth: { user, pass },
+});
+
 
 // ── Shared email wrapper ──────────────────────────────────────────────────────
 function emailWrapper(iconEmoji: string, title: string, subtitle: string, body: string): string {
