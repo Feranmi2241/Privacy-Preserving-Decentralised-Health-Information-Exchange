@@ -59,6 +59,13 @@ import {
 } from "./mailer";
 import { signToken, verifyToken, STRONG_PASSWORD_REGEX } from "./auth";
 
+const app = express();
+
+// Add this line to trust Render's proxy layer
+app.set('trust proxy', 1); 
+
+// Your rate limiter and routes follow below...
+
 // ── Initialize database on startup ──────────────────────────────────────────
 (async () => {
   try {
