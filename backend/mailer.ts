@@ -25,7 +25,7 @@ return nodemailer.createTransport({
   secure: true,
   auth: { user, pass },
 });
-
+}
 
 // ── Shared email wrapper ──────────────────────────────────────────────────────
 function emailWrapper(iconEmoji: string, title: string, subtitle: string, body: string): string {
