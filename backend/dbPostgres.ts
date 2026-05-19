@@ -67,6 +67,16 @@ export async function initializeDatabase(): Promise<void> {
       )
     `);
 
+    // OTPs table — persisted in DB so Render spin-down doesn't wipe them
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS otps (
+        key VARCHAR(255) PRIMARY KEY,
+        code VARCHAR(10) NOT NULL,
+        expires_at BIGINT NOT NULL,
+        purpose VARCHAR(10) NOT NULL
+      )
+    `);
+
     console.log("[Database] PostgreSQL tables initialized successfully");
   } catch (error) {
     console.error("[Database] Initialization failed:", error);
@@ -203,22 +213,33 @@ export function generateOTP(): string {
   return crypto.randomInt(100000, 1000000).toString();
 }
 
-export function storeOTP(email: string, code: string, purpose: "signup" | "forgot"): void {
-  otpStore.set(`${purpose}:${email.toLowerCase()}`, {
-    code,
-    expiresAt: Date.now() + OTP_TTL_MS,
-    purpose,
-  });
+export async function storeOTP(email: string, code: string, purpose: "signup" | "forgot"): Promise<void> {
+  const key = `${purpose}:${email.toLowerCase()}`;
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `INSERT INTO otps (key, code, expires_at, purpose) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (key) DO UPDATE SET code = $2, expires_at = $3`,
+      [key, code, Date.now() + OTP_TTL_MS, purpose]
+    );
+  } finally { client.release(); }
 }
 
-export function verifyOTP(email: string, code: string, purpose: "signup" | "forgot"): boolean {
+export async function verifyOTP(email: string, code: string, purpose: "signup" | "forgot"): Promise<boolean> {
   const key = `${purpose}:${email.toLowerCase()}`;
-  const record = otpStore.get(key);
-  if (!record) return false;
-  if (Date.now() > record.expiresAt) { otpStore.delete(key); return false; }
-  if (record.code !== code) return false;
-  otpStore.delete(key);
-  return true;
+  const client = await pool.connect();
+  try {
+    const result = await client.query('SELECT code, expires_at FROM otps WHERE key = $1', [key]);
+    if (result.rows.length === 0) return false;
+    const { code: stored, expires_at } = result.rows[0];
+    if (Date.now() > Number(expires_at)) {
+      await client.query('DELETE FROM otps WHERE key = $1', [key]);
+      return false;
+    }
+    if (stored !== code) return false;
+    await client.query('DELETE FROM otps WHERE key = $1', [key]);
+    return true;
+  } finally { client.release(); }
 }
 
 // ── Access request helpers (unchanged - remain in-memory) ─────────────────────

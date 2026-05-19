@@ -145,7 +145,7 @@ app.post("/auth/register", authLimiter, async (req: Request, res: Response) => {
   }
   await createHospital(name, email, password);
   const code = generateOTP();
-  storeOTP(email, code, "signup");
+  await storeOTP(email, code, "signup");
   try { await sendSignupOTP(email, code); } catch (e: any) { console.warn("[mailer]", e.message); }
   res.json({ message: "OTP sent to email" });
 });
@@ -159,11 +159,6 @@ app.post("/auth/verify-otp", otpLimiter, async (req: Request, res: Response) => 
   await markVerified(email);
   res.json({ message: "Email verified" });
 });
-app.set('trust proxy', 1);
-app.set('trust proxy', 1);
-app.set('trust proxy', 1);
-app.set('trust proxy', 1);
-
 // ── POST /auth/login ──────────────────────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req: Request, res: Response) => {
   const { email, password } = req.body;
@@ -184,7 +179,7 @@ app.post("/auth/forgot-password", authLimiter, async (req: Request, res: Respons
   const hospital  = await findHospital(email);
   if (!hospital) { res.json({ message: "If that email exists, an OTP was sent" }); return; }
   const code = generateOTP();
-  storeOTP(email, code, "forgot");
+  await storeOTP(email, code, "forgot");
   try { await sendForgotOTP(email, code); } catch (e: any) { console.warn("[mailer]", e.message); }
   res.json({ message: "If that email exists, an OTP was sent" });
 });
