@@ -1,10 +1,20 @@
-import { Resend } from "resend";
+import nodemailer from "nodemailer";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+function getTransporter(): nodemailer.Transporter {
+  return nodemailer.createTransport({
+    host: "smtp-relay.brevo.com",
+    port: 587,
+    secure: false,
+    auth: {
+      user: process.env.BREVO_SMTP_LOGIN,
+      pass: process.env.BREVO_SMTP_KEY,
+    },
+  });
+}
 
 async function sendEmail(to: string, subject: string, html: string): Promise<void> {
-  await resend.emails.send({
-    from: "Clinical Ledger HIE <onboarding@resend.dev>",
+  await getTransporter().sendMail({
+    from: `"Clinical Ledger HIE" <${process.env.BREVO_SMTP_LOGIN}>`,
     to,
     subject,
     html,
