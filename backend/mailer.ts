@@ -1,24 +1,23 @@
-import nodemailer from "nodemailer";
-
-function getTransporter(): nodemailer.Transporter {
-  return nodemailer.createTransport({
-    host: "smtp-relay.brevo.com",
-    port: 587,
-    secure: false,
-    auth: {
-      user: process.env.BREVO_SMTP_LOGIN,
-      pass: process.env.BREVO_SMTP_KEY,
-    },
-  });
-}
+import fetch from "node-fetch";
 
 async function sendEmail(to: string, subject: string, html: string): Promise<void> {
-  await getTransporter().sendMail({
-    from: `"Clinical Ledger HIE" <${process.env.BREVO_SMTP_LOGIN}>`,
-    to,
-    subject,
-    html,
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": process.env.BREVO_API_KEY as string,
+    },
+    body: JSON.stringify({
+      sender: { name: "Clinical Ledger HIE", email: process.env.BREVO_SENDER_EMAIL },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
   });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Brevo API error: ${err}`);
+  }
 }
 
 // ── Shared email wrapper ──────────────────────────────────────────────────────
