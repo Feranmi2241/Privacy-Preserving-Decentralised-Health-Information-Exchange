@@ -199,7 +199,18 @@ app.post("/auth/reset-password", otpLimiter, async (req: Request, res: Response)
     res.status(400).json({ error: "Password was used before" }); return;
   }
   await updatePassword(email, newPassword);
+  await markVerified(email);
   res.json({ message: "Password reset successful" });
+});
+
+// ── POST /admin/verify-email (temporary) ────────────────────────────────────
+app.post("/admin/verify-email", async (req: Request, res: Response) => {
+  const { secret, email } = req.body;
+  if (secret !== process.env.SESSION_SECRET) {
+    res.status(403).json({ error: "Forbidden" }); return;
+  }
+  await markVerified(email);
+  res.json({ message: `${email} marked as verified` });
 });
 
 // ── GET /network/status ───────────────────────────────────────────────────────
