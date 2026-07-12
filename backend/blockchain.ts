@@ -1,9 +1,6 @@
 import { ethers } from "ethers";
-import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
-
-dotenv.config();
 
 const { RPC_URL, PRIVATE_KEY, CONTRACT_ADDRESS } = process.env;
 
@@ -14,11 +11,12 @@ if (!RPC_URL || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
 }
 
 // ── ABI ───────────────────────────────────────────────────────────────────────
-// Resolve from process.cwd() (always backend/) so the path is correct
-// whether running via ts-node or compiled JS from dist/.
+// __dirname always resolves to the directory of THIS file (backend/ when
+// running via ts-node, backend/dist/ when compiled). Using process.cwd()+".."
+// breaks on Vercel where cwd() is /var/task, not the backend directory.
 
 const ABI_PATH = path.join(
-  process.cwd(),
+  __dirname,
   "..",
   "artifacts",
   "contracts",

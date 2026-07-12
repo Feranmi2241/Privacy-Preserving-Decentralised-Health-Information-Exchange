@@ -15,6 +15,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@sendgrid/mail": "^8.1.6",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
@@ -24,9 +25,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.20.0",
-    "pinata": "^2.5.5",
-    "node-fetch": "^2.7.0",
-    "resend": "^6.12.3"
+    "pinata": "^2.5.5"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -36,7 +35,6 @@
     "@types/helmet": "^0.0.48",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^25.5.0",
-    "@types/node-fetch": "^2.6.11",
     "@types/pg": "^8.20.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"

@@ -1,23 +1,19 @@
-import fetch from "node-fetch";
+import sgMail from "@sendgrid/mail";
+
+sgMail.setApiKey(process.env.SENDGRID_API_KEY as string);
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+}
 
 async function sendEmail(to: string, subject: string, html: string): Promise<void> {
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "api-key": process.env.BREVO_API_KEY as string,
-    },
-    body: JSON.stringify({
-      sender: { name: "Clinical Ledger HIE", email: process.env.BREVO_SENDER_EMAIL },
-      to: [{ email: to }],
-      subject,
-      htmlContent: html,
-    }),
-  });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Brevo API error: ${err}`);
-  }
+  const from = process.env.SENDGRID_FROM_EMAIL as string;
+  await sgMail.send({ from, to, subject, html });
 }
 
 // ── Shared email wrapper ──────────────────────────────────────────────────────
@@ -120,6 +116,8 @@ export async function sendPatientAuthorizationRequest(
   const approveUrl = `${backendUrl}/access/respond?token=${token}&action=approved`;
   const denyUrl    = `${backendUrl}/access/respond?token=${token}&action=denied`;
   const expiryTime = new Date(expiresAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const safeHospitalName = escapeHtml(hospitalName);
+  const safePatientId    = escapeHtml(patientId);
 
   await sendEmail(patientEmail, `Medical Record Access Request — ${hospitalName}`,
     emailWrapper("🔒", "Clinical Ledger HIE", "Patient Access Authorization · Decentralized Health Information Exchange", `
@@ -131,11 +129,11 @@ export async function sendPatientAuthorizationRequest(
         <table style="width:100%;font-size:13px;border-collapse:collapse">
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600;width:130px">Patient ID</td>
-            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${patientId}</td>
+            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${safePatientId}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600">Requesting Hospital</td>
-            <td style="padding:8px 0;color:#00464a;font-weight:700">${hospitalName}</td>
+            <td style="padding:8px 0;color:#00464a;font-weight:700">${safeHospitalName}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600">Request Expires</td>
@@ -165,6 +163,7 @@ export async function sendPatientAuthorizationRequest(
 export async function sendAccessGrantedNotification(
   hospitalEmail: string, hospitalName: string, patientId: string
 ): Promise<void> {
+  const safePatientId = escapeHtml(patientId);
   await sendEmail(hospitalEmail, `Access Approved — Patient ${patientId}`,
     emailWrapper("✅", "Clinical Ledger HIE", "Access Authorization · Patient Approved", `
       <p style="margin-bottom:16px;color:#3f4949">
@@ -174,7 +173,7 @@ export async function sendAccessGrantedNotification(
         <table style="width:100%;font-size:13px;border-collapse:collapse">
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600;width:130px">Patient ID</td>
-            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${patientId}</td>
+            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${safePatientId}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600">Status</td>
@@ -190,6 +189,7 @@ export async function sendAccessDeniedNotification(
   reason: "denied" | "expired"
 ): Promise<void> {
   const isExpired = reason === "expired";
+  const safePatientId = escapeHtml(patientId);
   await sendEmail(hospitalEmail, `Access ${isExpired ? "Expired" : "Denied"} — Patient ${patientId}`,
     emailWrapper(
       isExpired ? "⏰" : "❌",
@@ -204,7 +204,7 @@ export async function sendAccessDeniedNotification(
         <table style="width:100%;font-size:13px;border-collapse:collapse">
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600;width:130px">Patient ID</td>
-            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${patientId}</td>
+            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${safePatientId}</td>
           </tr>
           <tr>
             <td style="padding:8px 0;color:#6f7979;font-weight:600">Status</td>

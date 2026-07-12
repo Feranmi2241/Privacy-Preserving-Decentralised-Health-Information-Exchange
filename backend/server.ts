@@ -18,8 +18,8 @@ if (missing.length > 0) {
   );
   process.exit(1);
 }
-if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-  console.warn("[STARTUP WARN] EMAIL_USER or EMAIL_PASS not set — emails will be skipped.");
+if (!process.env.SENDGRID_API_KEY) {
+  console.warn("[STARTUP WARN] SENDGRID_API_KEY not set — emails will fail.");
 }
 
 // Warn if BACKEND_URL is still pointing to localhost in a likely production environment
@@ -37,6 +37,7 @@ if (!backendUrl || backendUrl.includes("localhost")) {
 import express, { Request, Response, NextFunction } from "express";
 import cors       from "cors";
 import helmet     from "helmet";
+import crypto     from "crypto";
 import rateLimit  from "express-rate-limit";
 import { PinataSDK } from "pinata";
 import { ethers }    from "ethers";
@@ -59,22 +60,14 @@ import {
 } from "./mailer";
 import { signToken, verifyToken, STRONG_PASSWORD_REGEX } from "./auth";
 
-// ── Initialize database on startup ──────────────────────────────────────────
-(async () => {
-  try {
-    await initializeDatabase();
-  } catch (error) {
-    console.error("[STARTUP ERROR] Database initialization failed:", error);
-    process.exit(1);
-  }
-})();
-
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app  = express();
 app.set('trust proxy', 1);
 
 const PORT = parseInt(process.env.PORT || "5000", 10);
-const allowedOrigin = process.env.ALLOWED_ORIGIN || "http://localhost:5173";
+// Strip trailing slash — CORS origin matching is exact, a trailing slash
+// causes every cross-origin request to be rejected in production.
+const allowedOrigin = (process.env.ALLOWED_ORIGIN || "http://localhost:5173").replace(/\/$/, "");
 
 app.use(helmet({
   // Allow inline styles for the access response HTML page
@@ -86,8 +79,12 @@ app.use(helmet({
     },
   },
 }));
-app.use(cors({ origin: allowedOrigin }));
-app.use(express.json({ limit: "20mb" }));
+app.use(cors({
+  origin: allowedOrigin,
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.use(express.json({ limit: "50kb" }));
 
 const RSA_PUBLIC_KEY  = process.env.RSA_PUBLIC_KEY  as string;
 const RSA_PRIVATE_KEY = process.env.RSA_PRIVATE_KEY as string;
@@ -134,6 +131,12 @@ app.post("/auth/register", authLimiter, async (req: Request, res: Response) => {
   if (!name || !email || !password) {
     res.status(400).json({ error: "name, email and password are required" }); return;
   }
+  if (typeof name !== "string" || name.trim().length === 0 || name.length > 100) {
+    res.status(400).json({ error: "Name must be between 1 and 100 characters" }); return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) {
+    res.status(400).json({ error: "Invalid email address" }); return;
+  }
   if (!termsAccepted) {
     res.status(400).json({ error: "You must accept the governance terms to register" }); return;
   }
@@ -153,7 +156,7 @@ app.post("/auth/register", authLimiter, async (req: Request, res: Response) => {
 // ── POST /auth/verify-otp ─────────────────────────────────────────────────────
 app.post("/auth/verify-otp", otpLimiter, async (req: Request, res: Response) => {
   const { email, code } = req.body;
-  if (!verifyOTP(email, code, "signup")) {
+  if (!await verifyOTP(email, code, "signup")) {
     res.status(400).json({ error: "Invalid or expired OTP" }); return;
   }
   await markVerified(email);
@@ -187,7 +190,7 @@ app.post("/auth/forgot-password", authLimiter, async (req: Request, res: Respons
 // ── POST /auth/reset-password ─────────────────────────────────────────────────
 app.post("/auth/reset-password", otpLimiter, async (req: Request, res: Response) => {
   const { email, code, newPassword } = req.body;
-  if (!verifyOTP(email, code, "forgot")) {
+  if (!await verifyOTP(email, code, "forgot")) {
     res.status(400).json({ error: "Invalid or expired OTP" }); return;
   }
   if (!STRONG_PASSWORD_REGEX.test(newPassword)) {
@@ -204,11 +207,16 @@ app.post("/auth/reset-password", otpLimiter, async (req: Request, res: Response)
 });
 
 // ── POST /admin/verify-email (temporary) ────────────────────────────────────
-app.post("/admin/verify-email", async (req: Request, res: Response) => {
+app.post("/admin/verify-email", authLimiter, async (req: Request, res: Response) => {
   const { secret, email } = req.body;
-  if (secret !== process.env.SESSION_SECRET) {
-    res.status(403).json({ error: "Forbidden" }); return;
+  if (!email || typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: "Valid email is required" }); return;
   }
+  const provided = Buffer.from(typeof secret === "string" ? secret : "");
+  const expected = Buffer.from(process.env.SESSION_SECRET!);
+  const match = provided.length === expected.length &&
+    crypto.timingSafeEqual(provided, expected);
+  if (!match) { res.status(403).json({ error: "Forbidden" }); return; }
   await markVerified(email);
   res.json({ message: `${email} marked as verified` });
 });
@@ -228,7 +236,7 @@ app.get("/network/status", requireAuth, async (_req: Request, res: Response) => 
       timestamp:     block?.timestamp ?? 0,
       nodeStatus:    "operational",
     });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
+  } catch (err: any) { console.error("[network/status]", err); res.status(500).json({ error: "Internal server error" }); }
 });
 
 // ── GET /records/all ──────────────────────────────────────────────────────────
@@ -236,11 +244,11 @@ app.get("/records/all", requireAuth, async (_req: Request, res: Response) => {
   try {
     const ids: string[] = await contract.getAllPatientIds();
     res.json({ total: ids.length, patientIds: ids });
-  } catch (error: any) { res.status(500).json({ error: error.message }); }
+  } catch (error: any) { console.error("[records/all]", error); res.status(500).json({ error: "Internal server error" }); }
 });
 
 // ── POST /add-record ──────────────────────────────────────────────────────────
-app.post("/add-record", requireAuth, async (req: Request, res: Response) => {
+app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req: Request, res: Response) => {
   try {
     const {
       patientId, fullName, dateOfBirth, patientEmail,
@@ -331,7 +339,7 @@ app.post("/add-record", requireAuth, async (req: Request, res: Response) => {
     res.json({ success: true, txHash: tx.hash, ipfsHash });
   } catch (error: any) {
     console.error("[add-record]", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -414,7 +422,7 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
     });
   } catch (err: any) {
     console.error("[access/request]", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -499,8 +507,8 @@ app.get("/access/respond", async (req: Request, res: Response) => {
       } catch (e: any) { console.warn("[mailer]", e.message); }
 
       res.send(responseHtml("✅ Access Approved",
-        `You have approved access for <strong>${request.hospitalName}</strong> ` +
-        `to your medical record (Patient ID: <code>${request.patientId}</code>). ` +
+        `You have approved access for <strong>${escapeHtml(request.hospitalName)}</strong> ` +
+        `to your medical record (Patient ID: <code>${escapeHtml(request.patientId)}</code>). ` +
         `The healthcare provider has been notified and can now access your record. ` +
         `You may close this window.`,
         "#00464a"));
@@ -520,8 +528,8 @@ app.get("/access/respond", async (req: Request, res: Response) => {
       } catch (e: any) { console.warn("[mailer]", e.message); }
 
       res.send(responseHtml("❌ Access Denied",
-        `You have denied access for <strong>${request.hospitalName}</strong> ` +
-        `to your medical record (Patient ID: <code>${request.patientId}</code>). ` +
+        `You have denied access for <strong>${escapeHtml(request.hospitalName)}</strong> ` +
+        `to your medical record (Patient ID: <code>${escapeHtml(request.patientId)}</code>). ` +
         `The healthcare provider has been notified. ` +
         `Your data remains private and secure. You may close this window.`,
         "#ba1a1a"));
@@ -618,7 +626,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     res.json(JSON.parse(agreed[0]));
   } catch (err: any) {
     console.error("[get-record]", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -635,7 +643,16 @@ app.get("/register/history/:patientId", requireAuth, (req: Request, res: Respons
   res.json({ patientId, history });
 });
 
-// ── HTML response page for patient email links ────────────────────────────────
+// ── HTML helpers ─────────────────────────────────────────────────────────────
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+}
+
 function responseHtml(title: string, message: string, color: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -675,8 +692,16 @@ function responseHtml(title: string, message: string, color: string): string {
 </html>`;
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`[Clinical Ledger HIE] Backend running on port ${PORT}`);
-  console.log(`[Clinical Ledger HIE] CORS origin: ${allowedOrigin}`);
+// ── Start — DB must be ready before accepting requests ───────────────────────
+async function startServer(): Promise<void> {
+  await initializeDatabase();
+  app.listen(PORT, () => {
+    console.log(`[Clinical Ledger HIE] Backend running on port ${PORT}`);
+    console.log(`[Clinical Ledger HIE] CORS origin: ${allowedOrigin}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("[STARTUP ERROR] Fatal:", err);
+  process.exit(1);
 });

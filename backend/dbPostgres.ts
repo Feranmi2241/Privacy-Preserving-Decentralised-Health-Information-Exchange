@@ -8,7 +8,7 @@
 
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
-import { Pool } from "pg";
+import { Pool, PoolConfig } from "pg";
 
 // ── Types (unchanged from original db.ts) ─────────────────────────────────────
 export interface Hospital {
@@ -17,12 +17,6 @@ export interface Hospital {
   passwordHash: string;
   passwordHistory: string[];
   verified: boolean;
-}
-
-interface OTPRecord {
-  code: string;
-  expiresAt: number;
-  purpose: "signup" | "forgot";
 }
 
 export interface AccessRequest {
@@ -37,9 +31,45 @@ export interface AccessRequest {
 }
 
 // ── Database Connection ───────────────────────────────────────────────────────
+// Pool lives at module scope — Node's module cache keeps it alive across warm
+// invocations of the same serverless instance, reusing the connection instead
+// of opening a new one on every request.
+//
+// max:1  — each Vercel instance holds at most 1 physical Postgres connection.
+//          Aiven free tier = 25 connections max. With pg's default max:10 you
+//          exhaust the limit at just 3 parallel cold-start instances.
+//
+// idleTimeoutMillis:10000 — releases idle connections after 10 s so cooled-
+//          down instances don't leave stale connections open on Aiven.
+//
+// connectionTimeoutMillis:5000 — fail fast on cold start if Aiven is
+//          unreachable, rather than hanging until Vercel's function timeout
+//          kills the request with no useful log message.
+
+function buildSslConfig(): PoolConfig["ssl"] {
+  const url = process.env.DATABASE_URL ?? "";
+  if (!url || url.includes("localhost") || url.includes("127.0.0.1")) {
+    return false;
+  }
+  if (process.env.AIVEN_CA_CERT) {
+    return { rejectUnauthorized: true, ca: process.env.AIVEN_CA_CERT };
+  }
+  return { rejectUnauthorized: false };
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  max: 1,
+  idleTimeoutMillis: 10_000,
+  connectionTimeoutMillis: 5_000,
+  ssl: buildSslConfig(),
+});
+
+// Surface pool-level errors in Vercel function logs. Without this, a dropped
+// idle connection causes the next query to fail with a cryptic error and no
+// stack trace pointing to the real cause.
+pool.on("error", (err) => {
+  console.error("[DB] Idle client error:", err.message);
 });
 
 // ── Database Schema Initialization ────────────────────────────────────────────
@@ -77,18 +107,16 @@ export async function initializeDatabase(): Promise<void> {
       )
     `);
 
-    console.log("[Database] PostgreSQL tables initialized successfully");
+    console.log("[DB] Tables ready");
   } catch (error) {
-    console.error("[Database] Initialization failed:", error);
+    console.error("[DB] Initialization failed:", error);
     throw error;
   } finally {
     client.release();
   }
 }
 
-// ── In-memory state (unchanged) ───────────────────────────────────────────────
-// OTPs and access requests remain in-memory as they should be ephemeral
-const otpStore = new Map<string, OTPRecord>();
+// ── In-memory state ─────────────────────────────────────────────────────────
 const accessRequests = new Map<string, AccessRequest>();
 const resolvedStatus = new Map<string, "approved" | "denied" | "expired">();
 
@@ -236,7 +264,9 @@ export async function verifyOTP(email: string, code: string, purpose: "signup" |
       await client.query('DELETE FROM otps WHERE key = $1', [key]);
       return false;
     }
-    if (stored !== code) return false;
+    if (!crypto.timingSafeEqual(Buffer.from(stored), Buffer.from(code))) {
+      return false;
+    }
     await client.query('DELETE FROM otps WHERE key = $1', [key]);
     return true;
   } finally { client.release(); }
@@ -274,10 +304,6 @@ export function createAccessRequest(
   };
   accessRequests.set(token, request);
   return request;
-}
-
-export function getAccessRequest(token: string): AccessRequest | undefined {
-  return accessRequests.get(token);
 }
 
 export function consumeAccessToken(token: string, action: "approved" | "denied"): AccessRequest | null {
