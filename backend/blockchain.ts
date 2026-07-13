@@ -18,6 +18,7 @@ if (!RPC_URL || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
 const ABI_PATH = path.join(
   __dirname,
   "..",
+  "..",
   "artifacts",
   "contracts",
   "MedicalRecord.sol",
