@@ -390,7 +390,7 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
 
     // Step 4: Create cryptographically secure access request token
     const user    = res.locals.user as { email: string; hospitalName: string };
-    const request = createAccessRequest(
+    const request = await createAccessRequest(
       patientId.trim(),
       patientEmail,
       user.hospitalName,
@@ -435,13 +435,13 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
  * interface to transition automatically when the patient approves —
  * demonstrating asynchronous coordination without a persistent UI.
  */
-app.get("/access/status", requireAuth, (req: Request, res: Response) => {
+app.get("/access/status", requireAuth, async (req: Request, res: Response) => {
   const { patientId } = req.query as { patientId?: string };
   if (!patientId) { res.status(400).json({ error: "patientId is required" }); return; }
 
   const user          = res.locals.user as { email: string };
-  const status        = checkAccessStatus(String(patientId).trim(), user.email);
-  const timeRemaining = getAccessRequestTimeRemaining(String(patientId).trim(), user.email);
+  const status        = await checkAccessStatus(String(patientId).trim(), user.email);
+  const timeRemaining = await getAccessRequestTimeRemaining(String(patientId).trim(), user.email);
 
   // Read from wait-free register — models distributed consent state check
   const register      = getOrCreateRegister(String(patientId).trim());
@@ -473,7 +473,7 @@ app.get("/access/respond", async (req: Request, res: Response) => {
     return;
   }
 
-  const request = consumeAccessToken(token, action);
+  const request = await consumeAccessToken(token, action);
 
   if (!request) {
     res.status(410).send(responseHtml("⏰ Link Expired or Already Used",

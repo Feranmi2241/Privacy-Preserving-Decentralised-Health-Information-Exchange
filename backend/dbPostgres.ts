@@ -1,6 +1,6 @@
 /**
  * dbPostgres.ts — PostgreSQL Database Layer
- * 
+ *
  * Replaces file-based storage with proper database persistence.
  * Maintains all existing interfaces so no other code changes needed.
  * All professor research implementations remain completely intact.
@@ -31,21 +31,6 @@ export interface AccessRequest {
 }
 
 // ── Database Connection ───────────────────────────────────────────────────────
-// Pool lives at module scope — Node's module cache keeps it alive across warm
-// invocations of the same serverless instance, reusing the connection instead
-// of opening a new one on every request.
-//
-// max:1  — each Vercel instance holds at most 1 physical Postgres connection.
-//          Aiven free tier = 25 connections max. With pg's default max:10 you
-//          exhaust the limit at just 3 parallel cold-start instances.
-//
-// idleTimeoutMillis:10000 — releases idle connections after 10 s so cooled-
-//          down instances don't leave stale connections open on Aiven.
-//
-// connectionTimeoutMillis:5000 — fail fast on cold start if Aiven is
-//          unreachable, rather than hanging until Vercel's function timeout
-//          kills the request with no useful log message.
-
 function buildSslConfig(): PoolConfig["ssl"] {
   const url = process.env.DATABASE_URL ?? "";
   if (!url || url.includes("localhost") || url.includes("127.0.0.1")) {
@@ -65,9 +50,6 @@ const pool = new Pool({
   ssl: buildSslConfig(),
 });
 
-// Surface pool-level errors in Vercel function logs. Without this, a dropped
-// idle connection causes the next query to fail with a cryptic error and no
-// stack trace pointing to the real cause.
 pool.on("error", (err) => {
   console.error("[DB] Idle client error:", err.message);
 });
@@ -76,7 +58,6 @@ pool.on("error", (err) => {
 export async function initializeDatabase(): Promise<void> {
   const client = await pool.connect();
   try {
-    // Hospitals table
     await client.query(`
       CREATE TABLE IF NOT EXISTS hospitals (
         email VARCHAR(255) PRIMARY KEY,
@@ -88,7 +69,6 @@ export async function initializeDatabase(): Promise<void> {
       )
     `);
 
-    // Patient emails table
     await client.query(`
       CREATE TABLE IF NOT EXISTS patient_emails (
         patient_id VARCHAR(100) PRIMARY KEY,
@@ -97,13 +77,25 @@ export async function initializeDatabase(): Promise<void> {
       )
     `);
 
-    // OTPs table — persisted in DB so Render spin-down doesn't wipe them
     await client.query(`
       CREATE TABLE IF NOT EXISTS otps (
         key VARCHAR(255) PRIMARY KEY,
         code VARCHAR(10) NOT NULL,
         expires_at BIGINT NOT NULL,
         purpose VARCHAR(10) NOT NULL
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS access_requests (
+        token VARCHAR(64) PRIMARY KEY,
+        patient_id VARCHAR(100) NOT NULL,
+        patient_email VARCHAR(255) NOT NULL,
+        hospital_name VARCHAR(255) NOT NULL,
+        hospital_email VARCHAR(255) NOT NULL,
+        expires_at BIGINT NOT NULL,
+        status VARCHAR(10) NOT NULL DEFAULT 'pending',
+        created_at BIGINT NOT NULL
       )
     `);
 
@@ -116,15 +108,11 @@ export async function initializeDatabase(): Promise<void> {
   }
 }
 
-// ── In-memory state ─────────────────────────────────────────────────────────
-const accessRequests = new Map<string, AccessRequest>();
-const resolvedStatus = new Map<string, "approved" | "denied" | "expired">();
-
 const BCRYPT_ROUNDS = 12;
 const OTP_TTL_MS = 10 * 60 * 1000;
 const ACCESS_REQUEST_TTL = 20 * 60 * 1000;
 
-// ── Password helpers (unchanged) ──────────────────────────────────────────────
+// ── Password helpers ──────────────────────────────────────────────────────────
 export async function hashPassword(plain: string): Promise<string> {
   return bcrypt.hash(plain, BCRYPT_ROUNDS);
 }
@@ -140,16 +128,15 @@ export async function isPasswordReused(plain: string, history: string[]): Promis
   return false;
 }
 
-// ── Hospital CRUD (now using PostgreSQL) ─────────────────────────────────────
+// ── Hospital CRUD ─────────────────────────────────────────────────────────────
 export async function findHospital(email: string): Promise<Hospital | undefined> {
   const client = await pool.connect();
   try {
     const result = await client.query(
-      'SELECT name, email, password_hash, password_history, verified FROM hospitals WHERE email = $1',
+      "SELECT name, email, password_hash, password_history, verified FROM hospitals WHERE email = $1",
       [email.toLowerCase()]
     );
     if (result.rows.length === 0) return undefined;
-    
     const row = result.rows[0];
     return {
       name: row.name,
@@ -168,16 +155,10 @@ export async function createHospital(name: string, email: string, plain: string)
   const client = await pool.connect();
   try {
     await client.query(
-      'INSERT INTO hospitals (name, email, password_hash, password_history, verified) VALUES ($1, $2, $3, $4, $5)',
+      "INSERT INTO hospitals (name, email, password_hash, password_history, verified) VALUES ($1, $2, $3, $4, $5)",
       [name, email.toLowerCase(), passwordHash, [], false]
     );
-    return {
-      name,
-      email: email.toLowerCase(),
-      passwordHash,
-      passwordHistory: [],
-      verified: false,
-    };
+    return { name, email: email.toLowerCase(), passwordHash, passwordHistory: [], verified: false };
   } finally {
     client.release();
   }
@@ -186,7 +167,7 @@ export async function createHospital(name: string, email: string, plain: string)
 export async function markVerified(email: string): Promise<void> {
   const client = await pool.connect();
   try {
-    await client.query('UPDATE hospitals SET verified = TRUE WHERE email = $1', [email.toLowerCase()]);
+    await client.query("UPDATE hospitals SET verified = TRUE WHERE email = $1", [email.toLowerCase()]);
   } finally {
     client.release();
   }
@@ -195,17 +176,17 @@ export async function markVerified(email: string): Promise<void> {
 export async function updatePassword(email: string, newPlain: string): Promise<void> {
   const client = await pool.connect();
   try {
-    // Get current password hash to add to history
-    const result = await client.query('SELECT password_hash, password_history FROM hospitals WHERE email = $1', [email.toLowerCase()]);
+    const result = await client.query(
+      "SELECT password_hash, password_history FROM hospitals WHERE email = $1",
+      [email.toLowerCase()]
+    );
     if (result.rows.length === 0) return;
-    
     const currentHash = result.rows[0].password_hash;
     const currentHistory = result.rows[0].password_history || [];
-    const newHistory = [...currentHistory, currentHash].slice(-5); // Keep last 5
+    const newHistory = [...currentHistory, currentHash].slice(-5);
     const newHash = await hashPassword(newPlain);
-    
     await client.query(
-      'UPDATE hospitals SET password_hash = $1, password_history = $2 WHERE email = $3',
+      "UPDATE hospitals SET password_hash = $1, password_history = $2 WHERE email = $3",
       [newHash, newHistory, email.toLowerCase()]
     );
   } finally {
@@ -213,12 +194,12 @@ export async function updatePassword(email: string, newPlain: string): Promise<v
   }
 }
 
-// ── Patient email store (now using PostgreSQL) ───────────────────────────────
+// ── Patient email store ───────────────────────────────────────────────────────
 export async function storePatientEmail(patientId: string, email: string): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(
-      'INSERT INTO patient_emails (patient_id, email) VALUES ($1, $2) ON CONFLICT (patient_id) DO UPDATE SET email = $2',
+      "INSERT INTO patient_emails (patient_id, email) VALUES ($1, $2) ON CONFLICT (patient_id) DO UPDATE SET email = $2",
       [patientId.toLowerCase(), email.toLowerCase()]
     );
   } finally {
@@ -229,14 +210,17 @@ export async function storePatientEmail(patientId: string, email: string): Promi
 export async function getPatientEmail(patientId: string): Promise<string | undefined> {
   const client = await pool.connect();
   try {
-    const result = await client.query('SELECT email FROM patient_emails WHERE patient_id = $1', [patientId.toLowerCase()]);
+    const result = await client.query(
+      "SELECT email FROM patient_emails WHERE patient_id = $1",
+      [patientId.toLowerCase()]
+    );
     return result.rows.length > 0 ? result.rows[0].email : undefined;
   } finally {
     client.release();
   }
 }
 
-// ── OTP helpers (unchanged - remain in-memory) ───────────────────────────────
+// ── OTP helpers ───────────────────────────────────────────────────────────────
 export function generateOTP(): string {
   return crypto.randomInt(100000, 1000000).toString();
 }
@@ -257,99 +241,112 @@ export async function verifyOTP(email: string, code: string, purpose: "signup" |
   const key = `${purpose}:${email.toLowerCase()}`;
   const client = await pool.connect();
   try {
-    const result = await client.query('SELECT code, expires_at FROM otps WHERE key = $1', [key]);
+    const result = await client.query("SELECT code, expires_at FROM otps WHERE key = $1", [key]);
     if (result.rows.length === 0) return false;
     const { code: stored, expires_at } = result.rows[0];
     if (Date.now() > Number(expires_at)) {
-      await client.query('DELETE FROM otps WHERE key = $1', [key]);
+      await client.query("DELETE FROM otps WHERE key = $1", [key]);
       return false;
     }
-    if (!crypto.timingSafeEqual(Buffer.from(stored), Buffer.from(code))) {
-      return false;
-    }
-    await client.query('DELETE FROM otps WHERE key = $1', [key]);
+    if (!crypto.timingSafeEqual(Buffer.from(stored), Buffer.from(code))) return false;
+    await client.query("DELETE FROM otps WHERE key = $1", [key]);
     return true;
   } finally { client.release(); }
 }
 
-// ── Access request helpers (unchanged - remain in-memory) ─────────────────────
-export function createAccessRequest(
+// ── Access request helpers (PostgreSQL-backed) ────────────────────────────────
+export async function createAccessRequest(
   patientId: string,
   patientEmail: string,
   hospitalName: string,
   hospitalEmail: string
-): AccessRequest {
-  const resolvedKey = `${patientId}:${hospitalEmail.toLowerCase()}`;
-  resolvedStatus.delete(resolvedKey);
-  for (const [key, req] of accessRequests.entries()) {
-    if (
-      req.patientId === patientId &&
-      req.hospitalEmail === hospitalEmail.toLowerCase() &&
-      req.status === "pending"
-    ) {
-      accessRequests.delete(key);
-    }
-  }
-
-  const token = crypto.randomBytes(32).toString("hex");
-  const request: AccessRequest = {
-    token,
-    patientId,
-    patientEmail: patientEmail.toLowerCase(),
-    hospitalName,
-    hospitalEmail: hospitalEmail.toLowerCase(),
-    expiresAt: Date.now() + ACCESS_REQUEST_TTL,
-    status: "pending",
-    createdAt: Date.now(),
-  };
-  accessRequests.set(token, request);
-  return request;
+): Promise<AccessRequest> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `UPDATE access_requests SET status = 'expired'
+       WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'`,
+      [patientId, hospitalEmail.toLowerCase()]
+    );
+    const token = crypto.randomBytes(32).toString("hex");
+    const now = Date.now();
+    const expiresAt = now + ACCESS_REQUEST_TTL;
+    await client.query(
+      `INSERT INTO access_requests
+         (token, patient_id, patient_email, hospital_name, hospital_email, expires_at, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)`,
+      [token, patientId, patientEmail.toLowerCase(), hospitalName, hospitalEmail.toLowerCase(), expiresAt, now]
+    );
+    return {
+      token, patientId,
+      patientEmail: patientEmail.toLowerCase(),
+      hospitalName,
+      hospitalEmail: hospitalEmail.toLowerCase(),
+      expiresAt, status: "pending", createdAt: now,
+    };
+  } finally { client.release(); }
 }
 
-export function consumeAccessToken(token: string, action: "approved" | "denied"): AccessRequest | null {
-  const req = accessRequests.get(token);
-  if (!req) return null;
-  if (req.status !== "pending") return null;
-  if (Date.now() > req.expiresAt) {
-    req.status = "expired";
-    return null;
-  }
-  req.status = action;
-  const resolvedKey = `${req.patientId}:${req.hospitalEmail}`;
-  resolvedStatus.set(resolvedKey, action);
-  accessRequests.delete(token);
-  return req;
+export async function consumeAccessToken(token: string, action: "approved" | "denied"): Promise<AccessRequest | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query("SELECT * FROM access_requests WHERE token = $1", [token]);
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    if (row.status !== "pending") return null;
+    if (Date.now() > Number(row.expires_at)) {
+      await client.query("UPDATE access_requests SET status = 'expired' WHERE token = $1", [token]);
+      return null;
+    }
+    await client.query("UPDATE access_requests SET status = $1 WHERE token = $2", [action, token]);
+    return {
+      token: row.token,
+      patientId: row.patient_id,
+      patientEmail: row.patient_email,
+      hospitalName: row.hospital_name,
+      hospitalEmail: row.hospital_email,
+      expiresAt: Number(row.expires_at),
+      status: action,
+      createdAt: Number(row.created_at),
+    };
+  } finally { client.release(); }
 }
 
-export function checkAccessStatus(patientId: string, hospitalEmail: string): "pending" | "approved" | "denied" | "expired" | "not_found" {
-  const resolvedKey = `${patientId}:${hospitalEmail.toLowerCase()}`;
-  const resolved = resolvedStatus.get(resolvedKey);
-  if (resolved) return resolved;
-
-  for (const req of accessRequests.values()) {
-    if (req.patientId === patientId && req.hospitalEmail === hospitalEmail.toLowerCase()) {
-      if (Date.now() > req.expiresAt) {
-        req.status = "expired";
-        resolvedStatus.set(resolvedKey, "expired");
-        return "expired";
-      }
-      return req.status;
+export async function checkAccessStatus(patientId: string, hospitalEmail: string): Promise<"pending" | "approved" | "denied" | "expired" | "not_found"> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT status, expires_at FROM access_requests
+       WHERE patient_id = $1 AND hospital_email = $2
+       ORDER BY created_at DESC LIMIT 1`,
+      [patientId, hospitalEmail.toLowerCase()]
+    );
+    if (result.rows.length === 0) return "not_found";
+    const { status, expires_at } = result.rows[0];
+    if (status === "pending" && Date.now() > Number(expires_at)) {
+      await client.query(
+        `UPDATE access_requests SET status = 'expired'
+         WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'`,
+        [patientId, hospitalEmail.toLowerCase()]
+      );
+      return "expired";
     }
-  }
-  return "not_found";
+    return status;
+  } finally { client.release(); }
 }
 
-export function getAccessRequestTimeRemaining(patientId: string, hospitalEmail: string): number {
-  for (const req of accessRequests.values()) {
-    if (
-      req.patientId === patientId &&
-      req.hospitalEmail === hospitalEmail.toLowerCase() &&
-      req.status === "pending"
-    ) {
-      return Math.max(0, req.expiresAt - Date.now());
-    }
-  }
-  return 0;
+export async function getAccessRequestTimeRemaining(patientId: string, hospitalEmail: string): Promise<number> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT expires_at FROM access_requests
+       WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'
+       ORDER BY created_at DESC LIMIT 1`,
+      [patientId, hospitalEmail.toLowerCase()]
+    );
+    if (result.rows.length === 0) return 0;
+    return Math.max(0, Number(result.rows[0].expires_at) - Date.now());
+  } finally { client.release(); }
 }
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
