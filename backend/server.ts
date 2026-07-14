@@ -301,7 +301,7 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     }
 
     const record = {
-      patientId:          patientId.trim(),
+      patientId:          patientId.trim().toLowerCase(),
       fullName:           fullName.trim(),
       dateOfBirth:        dateOfBirth.trim(),
       patientEmail:       patientEmail.trim().toLowerCase(),
@@ -321,7 +321,7 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     };
 
     // Persist patient email for future access requests
-    await storePatientEmail(patientId.trim(), patientEmail.trim().toLowerCase());
+    await storePatientEmail(patientId.trim().toLowerCase(), patientEmail.trim().toLowerCase());
 
     // Hybrid-encrypt (AES-256-CBC + RSA-2048)
     const payload: EncryptedPayload = encryptRecord(JSON.stringify(record), RSA_PUBLIC_KEY);
@@ -333,14 +333,14 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     // Store on-chain
     const prevHash = (previousIpfsHash && typeof previousIpfsHash === "string")
       ? previousIpfsHash.trim() : "";
-    const tx = await contract.storeRecord(patientId.trim(), ipfsHash, prevHash);
+    const tx = await contract.storeRecord(patientId.trim().toLowerCase(), ipfsHash, prevHash);
     await tx.wait();
 
     // Email notification
     const user = res.locals.user as { email: string };
     if (user?.email) {
       try {
-        await sendRecordStoredNotification(user.email, patientId.trim(), tx.hash, ipfsHash);
+        await sendRecordStoredNotification(user.email, patientId.trim().toLowerCase(), tx.hash, ipfsHash);
       } catch (e: any) { console.warn("[mailer]", e.message); }
     }
 
@@ -377,7 +377,15 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
     // Step 1: Verify IPFS CID matches on-chain record
     // Uses getIpfsHash (no consent required) — consent is not yet granted
     // at this point; that happens only after the patient approves.
-    const onChainIpfs = await contract.getIpfsHash(patientId.trim());
+    let onChainIpfs: string;
+    try {
+      onChainIpfs = await contract.getIpfsHash(patientId.trim().toLowerCase());
+    } catch (err: any) {
+      if (err.reason && err.reason.includes("Record not found")) {
+        res.status(404).json({ error: "Record not found on blockchain" }); return;
+      }
+      throw err;
+    }
     if (onChainIpfs !== ipfsCid.trim()) {
       res.status(403).json({ error: "Invalid input details" }); return;
     }
@@ -390,7 +398,7 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
     }
 
     // Step 3: Look up patient email
-    const patientEmail = await getPatientEmail(patientId.trim());
+    const patientEmail = await getPatientEmail(patientId.trim().toLowerCase());
     if (!patientEmail) {
       res.status(404).json({ error: "Patient email not found. Record may have been stored before this feature was added." });
       return;
@@ -399,7 +407,7 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
     // Step 4: Create cryptographically secure access request token
     const user    = res.locals.user as { email: string; hospitalName: string };
     const request = await createAccessRequest(
-      patientId.trim(),
+      patientId.trim().toLowerCase(),
       patientEmail,
       user.hospitalName,
       user.email
@@ -407,14 +415,14 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
 
     // Step 5: Write "pending" to the wait-free register for this patient
     // This models the asynchronous consent state update in the distributed system
-    const register = getOrCreateRegister(patientId.trim());
+    const register = getOrCreateRegister(patientId.trim().toLowerCase());
     register.write("pending", user.email);
 
     // Step 6: Send authorization email to patient
     try {
       await sendPatientAuthorizationRequest(
         patientEmail,
-        patientId.trim(),
+        patientId.trim().toLowerCase(),
         user.hospitalName,
         request.token,
         request.expiresAt
@@ -568,7 +576,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
   }
 
   const fetchRecord = async () => {
-    const onChain  = await contract.getRecord(id);
+    const onChain  = await contract.getRecord(id.toLowerCase());
     const ipfsHash = onChain[1] as string;
     const data     = await pinata.gateways.public.get(ipfsHash);
     const payload  = data.data as unknown as EncryptedPayload;
@@ -600,7 +608,15 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
 
   try {
     // Verify IPFS CID using getIpfsHash (no consent required at this stage)
-    const onChainIpfs = await contract.getIpfsHash(id);
+    let onChainIpfs: string;
+    try {
+      onChainIpfs = await contract.getIpfsHash(id.toLowerCase());
+    } catch (err: any) {
+      if (err.reason && err.reason.includes("Record not found")) {
+        res.status(404).json({ error: "Record not found on blockchain" }); return;
+      }
+      throw err;
+    }
     if (onChainIpfs !== ipfsCid.trim()) {
       res.status(403).json({ error: "Invalid input details" }); return;
     }
@@ -625,7 +641,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     }
 
     // Read wait-free register — confirms consent state before returning data
-    const register      = getOrCreateRegister(id);
+    const register      = getOrCreateRegister(id.toLowerCase());
     const registerState = register.read(res.locals.user.email);
     if (registerState.value !== "approved") {
       res.status(403).json({ error: "Patient consent not confirmed in distributed register" }); return;
