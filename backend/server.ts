@@ -84,7 +84,7 @@ app.use(cors({
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
-app.use(express.json({ limit: "50kb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const RSA_PUBLIC_KEY  = process.env.RSA_PUBLIC_KEY  as string;
 const RSA_PRIVATE_KEY = process.env.RSA_PRIVATE_KEY as string;
