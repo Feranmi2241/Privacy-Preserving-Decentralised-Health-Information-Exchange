@@ -86,8 +86,16 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "20mb" }));
 
-const RSA_PUBLIC_KEY  = process.env.RSA_PUBLIC_KEY  as string;
-const RSA_PRIVATE_KEY = process.env.RSA_PRIVATE_KEY as string;
+function parsePemEnv(value: string | undefined, label: string): string {
+  if (!value) {
+    console.error(`[STARTUP ERROR] Missing required RSA key: ${label}`);
+    process.exit(1);
+  }
+  return value.replace(/\\n/g, "\n").replace(/^"|"$/g, "");
+}
+
+const RSA_PUBLIC_KEY  = parsePemEnv(process.env.RSA_PUBLIC_KEY, "RSA_PUBLIC_KEY");
+const RSA_PRIVATE_KEY = parsePemEnv(process.env.RSA_PRIVATE_KEY, "RSA_PRIVATE_KEY");
 
 const pinata = new PinataSDK({
   pinataJwt:     process.env.PINATA_JWT     as string,
