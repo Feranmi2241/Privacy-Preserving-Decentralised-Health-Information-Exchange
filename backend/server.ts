@@ -456,11 +456,12 @@ app.get("/access/status", requireAuth, async (req: Request, res: Response) => {
   if (!patientId) { res.status(400).json({ error: "patientId is required" }); return; }
 
   const user          = res.locals.user as { email: string };
-  const status        = await checkAccessStatus(String(patientId).trim(), user.email);
-  const timeRemaining = await getAccessRequestTimeRemaining(String(patientId).trim(), user.email);
+  const pid           = String(patientId).trim().toLowerCase();
+  const status        = await checkAccessStatus(pid, user.email);
+  const timeRemaining = await getAccessRequestTimeRemaining(pid, user.email);
 
   // Read from wait-free register — models distributed consent state check
-  const register      = getOrCreateRegister(String(patientId).trim());
+  const register      = getOrCreateRegister(pid);
   const registerState = register.read(user.email);
 
   res.json({ status, timeRemaining, registerState });
