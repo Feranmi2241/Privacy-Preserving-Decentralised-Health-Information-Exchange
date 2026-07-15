@@ -121,7 +121,7 @@ export default function RecordViewer({ token }: { token: string }) {
       setMaskedEmail(data.patientEmail || '');
       setTimeRemaining(ACCESS_TIMEOUT_MS);
       setStep('waiting');
-      startPolling();
+      startPolling(patientId.trim(), txHash.trim(), ipfsCid.trim());
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -129,8 +129,28 @@ export default function RecordViewer({ token }: { token: string }) {
     }
   };
 
-  // Poll /access/status every 5 seconds
-  const startPolling = () => {
+  // Fetch the full record after approval — accepts explicit values to avoid stale closures
+  const fetchRecord = async (pid: string, tx: string, cid: string) => {
+    setLoading(true);
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(pid)}` +
+        `?txHash=${encodeURIComponent(tx)}&ipfsCid=${encodeURIComponent(cid)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to retrieve record');
+      setRecord(data);
+      setStep('result');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Poll /access/status every 5 seconds — accepts explicit values to avoid stale closures
+  const startPolling = (pid: string, tx: string, cid: string) => {
     stopPolling();
 
     // Countdown timer
@@ -146,7 +166,7 @@ export default function RecordViewer({ token }: { token: string }) {
     pollRef.current = setInterval(async () => {
       try {
         const res = await fetch(
-          `${import.meta.env.VITE_API_URL}/access/status?patientId=${encodeURIComponent(patientId.trim())}`,
+          `${import.meta.env.VITE_API_URL}/access/status?patientId=${encodeURIComponent(pid)}`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
         const data = await res.json();
@@ -155,32 +175,12 @@ export default function RecordViewer({ token }: { token: string }) {
 
         if (status === 'approved') {
           stopPolling();
-          await fetchRecord();
+          await fetchRecord(pid, tx, cid);
         } else if (status === 'denied' || status === 'expired') {
           stopPolling();
         }
       } catch { /* non-fatal — keep polling */ }
     }, 5000);
-  };
-
-  // Fetch the full record after approval
-  const fetchRecord = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(
-        `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(patientId.trim())}` +
-        `?txHash=${encodeURIComponent(txHash.trim())}&ipfsCid=${encodeURIComponent(ipfsCid.trim())}`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to retrieve record');
-      setRecord(data);
-      setStep('result');
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
   };
 
   // Resend authorization request
@@ -197,7 +197,7 @@ export default function RecordViewer({ token }: { token: string }) {
       setResendInfo('A new authorization request has been sent to the patient.');
       setAccessStatus('pending');
       setTimeRemaining(ACCESS_TIMEOUT_MS);
-      startPolling();
+      startPolling(patientId.trim(), txHash.trim(), ipfsCid.trim());
     } catch (err: any) {
       setError(err.message);
     } finally {

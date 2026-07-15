@@ -577,7 +577,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
   }
 
   const fetchRecord = async () => {
-    const onChain  = await contract.getRecord(id.toLowerCase());
+    const onChain  = await contract.getRecord.staticCall(id.toLowerCase());
     const ipfsHash = onChain[1] as string;
     const data     = await pinata.gateways.public.get(ipfsHash);
     const payload  = data.data as unknown as EncryptedPayload;
