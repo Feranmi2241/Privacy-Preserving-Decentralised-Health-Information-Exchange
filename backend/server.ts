@@ -124,6 +124,18 @@ app.get("/", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "Clinical Ledger HIE Backend" });
 });
 
+// ── Temporary diagnostics (remove after fixing) ───────────────────────────────
+app.get("/debug/env", (_req: Request, res: Response) => {
+  const secret = process.env.SESSION_SECRET ?? "";
+  res.json({
+    SESSION_SECRET_length: secret.length,
+    SESSION_SECRET_first4: secret.slice(0, 4),
+    SESSION_SECRET_last4:  secret.slice(-4),
+    ALLOWED_ORIGIN: process.env.ALLOWED_ORIGIN ?? "(not set)",
+    NODE_ENV: process.env.NODE_ENV ?? "(not set)",
+  });
+});
+
 // ── Auth middleware ───────────────────────────────────────────────────────────
 function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const token   = req.headers.authorization?.split(" ")[1];
