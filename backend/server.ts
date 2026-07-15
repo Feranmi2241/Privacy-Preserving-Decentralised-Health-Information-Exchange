@@ -336,13 +336,24 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     const tx = await contract.storeRecord(patientId.trim().toLowerCase(), ipfsHash, prevHash);
     await tx.wait();
 
-    // Email notification
+    // Email notification to hospital
     const user = res.locals.user as { email: string };
     if (user?.email) {
       try {
         await sendRecordStoredNotification(user.email, patientId.trim().toLowerCase(), tx.hash, ipfsHash);
       } catch (e: any) { console.warn("[mailer]", e.message); }
     }
+
+    // Email notification to patient — sends Tx Hash + IPFS CID so they can
+    // provide these to any hospital requesting access to their record.
+    try {
+      await sendRecordStoredNotification(
+        patientEmail.trim().toLowerCase(),
+        patientId.trim().toLowerCase(),
+        tx.hash,
+        ipfsHash
+      );
+    } catch (e: any) { console.warn("[mailer] patient notification failed:", e.message); }
 
     res.json({ success: true, txHash: tx.hash, ipfsHash });
   } catch (error: any) {
