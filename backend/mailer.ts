@@ -80,31 +80,62 @@ export async function sendForgotOTP(email: string, code: string): Promise<void> 
 }
 
 // ── Record stored notification ────────────────────────────────────────────────
+// encounterLabel: "Initial Record" for first record, "Encounter N" for amendments (Task 4 naming)
 export async function sendRecordStoredNotification(
-  email: string, patientId: string, txHash: string, ipfsHash: string
+  email: string, patientId: string, txHash: string, ipfsHash: string,
+  patientName: string, encounterLabel: string
 ): Promise<void> {
-  await sendEmail(email, `Record Stored on Blockchain — Patient ${patientId}`,
-    emailWrapper("⛓️", "Clinical Ledger HIE", "Immutable Record Confirmation · AES-256 Encrypted", `
-      <p style="margin-bottom:20px;color:#3f4949">
-        A medical record has been successfully encrypted, pinned to IPFS,
-        and anchored on the Ethereum blockchain.
-      </p>
+  const isFirst      = encounterLabel === "Initial Record";
+  const safePatient  = escapeHtml(patientName || patientId);
+  const safeLabel    = escapeHtml(encounterLabel);
+  const safeId       = escapeHtml(patientId);
+
+  const subject = isFirst
+    ? `Medical Record Created — ${safePatient} (${patientId})`
+    : `New Encounter Added — ${safePatient}'s Record (${patientId})`;
+
+  const subtitle = isFirst
+    ? "Initial Record Confirmation · AES-256 Encrypted"
+    : `${safeLabel} · AES-256 Encrypted`;
+
+  const intro = isFirst
+    ? `A new medical record for <strong>${safePatient}</strong> has been encrypted, pinned to IPFS, and anchored on the Ethereum blockchain.`
+    : `A new encounter (<strong>${safeLabel}</strong>) has been added to <strong>${safePatient}</strong>'s existing record and anchored on the Ethereum blockchain.`;
+
+  const accessNote = isFirst
+    ? `Any hospital wishing to view this record can request access using the <strong>Patient ID</strong> — the patient will receive an approval email and no manual hash entry is required.`
+    : `Access to the full encounter history is granted by Patient ID approval — no tx hash or IPFS CID needs to be forwarded to any hospital.`;
+
+  await sendEmail(email, subject,
+    emailWrapper("⛓️", "Clinical Ledger HIE", subtitle, `
+      <p style="margin-bottom:20px;color:#3f4949">${intro}</p>
       <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px">
         <tr style="background:#f0f4f8">
-          <td style="padding:12px;color:#3f4949;width:110px;font-weight:600">Patient ID</td>
-          <td style="padding:12px;color:#171c1f;font-weight:700">${patientId}</td>
+          <td style="padding:12px;color:#3f4949;width:120px;font-weight:600">Patient</td>
+          <td style="padding:12px;color:#171c1f;font-weight:700">${safePatient}</td>
+        </tr>
+        <tr style="border-top:1px solid #dfe3e7">
+          <td style="padding:12px;color:#3f4949;font-weight:600">Patient ID</td>
+          <td style="padding:12px;color:#171c1f;font-weight:700;font-family:monospace">${safeId}</td>
+        </tr>
+        <tr style="border-top:1px solid #dfe3e7;background:#f0f4f8">
+          <td style="padding:12px;color:#3f4949;font-weight:600">Record Type</td>
+          <td style="padding:12px;color:#00464a;font-weight:700">${safeLabel}</td>
         </tr>
         <tr style="border-top:1px solid #dfe3e7">
           <td style="padding:12px;color:#3f4949;font-weight:600">Tx Hash</td>
           <td style="padding:12px;color:#00464a;font-family:monospace;
-                     word-break:break-all;font-size:11px">${txHash}</td>
+                     word-break:break-all;font-size:11px">${escapeHtml(txHash)}</td>
         </tr>
         <tr style="border-top:1px solid #dfe3e7;background:#f0f4f8">
           <td style="padding:12px;color:#3f4949;font-weight:600">IPFS CID</td>
           <td style="padding:12px;color:#0047d6;font-family:monospace;
-                     word-break:break-all;font-size:11px">${ipfsHash}</td>
+                     word-break:break-all;font-size:11px">${escapeHtml(ipfsHash)}</td>
         </tr>
-      </table>`));
+      </table>
+      <div style="padding:14px;background:#f0f4f8;border-radius:10px;border-left:3px solid #00464a;margin-bottom:8px">
+        <p style="font-size:12px;color:#3f4949;margin:0">${accessNote}</p>
+      </div>`));
 }
 
 // ── Patient access authorization request ─────────────────────────────────────

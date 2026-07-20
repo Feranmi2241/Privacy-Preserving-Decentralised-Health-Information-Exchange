@@ -266,50 +266,110 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
       medication, dosage, instructions,
       doctorName, department,
       profilePhoto, previousIpfsHash,
+      allergiesUnchanged, conditionsUnchanged,
     } = req.body;
 
-    // Required field validation
-    const requiredFields: Record<string, string> = {
-      patientId, fullName, dateOfBirth, patientEmail, phone, address,
-      bloodGroup, symptoms, diagnosis,
-      medication, dosage, instructions, doctorName, department,
+    const keepAllergies   = allergiesUnchanged   === true || allergiesUnchanged   === "true";
+    const keepConditions  = conditionsUnchanged  === true || conditionsUnchanged  === "true";
+
+    // Patient ID is always required
+    if (typeof patientId !== "string" || patientId.trim().length === 0) {
+      res.status(400).json({ error: "Missing or invalid field: patientId" }); return;
+    }
+    if (!/^[A-Za-z0-9\-]+$/.test(patientId.trim())) {
+      res.status(400).json({ error: "Patient ID may only contain letters, digits and hyphens" }); return;
+    }
+
+    const isAmendment = typeof previousIpfsHash === "string" && previousIpfsHash.trim().length > 0;
+    const prevHash    = isAmendment ? previousIpfsHash.trim() : "";
+
+    // Encounter fields are required on every submission (first record AND amendment)
+    const encounterFields: Record<string, string> = {
+      symptoms, diagnosis, medication, dosage, instructions, doctorName, department,
     };
-    for (const [key, val] of Object.entries(requiredFields)) {
+    for (const [key, val] of Object.entries(encounterFields)) {
       if (typeof val !== "string" || val.trim().length === 0) {
         res.status(400).json({ error: `Missing or invalid field: ${key}` }); return;
       }
     }
 
-    // Patient ID format
-    if (!/^[A-Za-z0-9\-]+$/.test(patientId.trim())) {
-      res.status(400).json({ error: "Patient ID may only contain letters, digits and hyphens" }); return;
-    }
+    // ── Profile fields: required on first record, backfilled from previous version on amendment ──
+    let resolvedFullName      = typeof fullName      === "string" ? fullName.trim()      : "";
+    let resolvedDateOfBirth   = typeof dateOfBirth   === "string" ? dateOfBirth.trim()   : "";
+    let resolvedPatientEmail  = typeof patientEmail  === "string" ? patientEmail.trim().toLowerCase()  : "";
+    let resolvedPhone         = typeof phone         === "string" ? phone.trim()         : "";
+    let resolvedAddress       = typeof address       === "string" ? address.trim()       : "";
+    let resolvedBloodGroup    = typeof bloodGroup    === "string" ? bloodGroup.trim()    : "";
+    let resolvedProfilePhoto  = (profilePhoto && typeof profilePhoto === "string") ? profilePhoto : "";
+    let resolvedAllergies     = typeof allergies          === "string" ? allergies.trim()          : "";
+    let resolvedConditions    = typeof existingConditions === "string" ? existingConditions.trim() : "";
 
-    // Patient email format
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(patientEmail.trim())) {
-      res.status(400).json({ error: "Invalid patient email address" }); return;
-    }
+    if (isAmendment) {
+      // Fetch and decrypt the previous version to backfill any Profile fields not supplied
+      try {
+        const prevVersionCount = await contract.getRecordCount(patientId.trim().toLowerCase());
+        const prevOnChain = await contract.getRecordVersion.staticCall(
+          patientId.trim().toLowerCase(),
+          Number(prevVersionCount)
+        );
+        const prevIpfsHash = prevOnChain[0] as string;
+        const prevData     = await pinata.gateways.public.get(prevIpfsHash);
+        const prevPayload  = prevData.data as unknown as EncryptedPayload;
+        const prevParsed   = JSON.parse(decryptRecord(prevPayload, RSA_PRIVATE_KEY));
 
-    // Profile photo validation
-    if (profilePhoto && typeof profilePhoto === "string") {
-      if (!profilePhoto.startsWith("data:image/")) {
-        res.status(400).json({ error: "Invalid profile photo format" }); return;
+        if (!resolvedFullName)     resolvedFullName     = prevParsed.fullName     || "";
+        if (!resolvedDateOfBirth)  resolvedDateOfBirth  = prevParsed.dateOfBirth  || "";
+        if (!resolvedPatientEmail) resolvedPatientEmail = prevParsed.patientEmail || "";
+        if (!resolvedPhone)        resolvedPhone        = prevParsed.phone        || "";
+        if (!resolvedAddress)      resolvedAddress      = prevParsed.address      || "";
+        if (!resolvedBloodGroup)   resolvedBloodGroup   = prevParsed.bloodGroup   || "";
+        if (!resolvedProfilePhoto) resolvedProfilePhoto = prevParsed.profilePhoto || "";
+
+        // Carry forward allergies / conditions when the frontend signals "unchanged"
+        if (keepAllergies)  resolvedAllergies   = prevParsed.allergies          || "";
+        if (keepConditions) resolvedConditions  = prevParsed.existingConditions || "";
+      } catch (fetchErr: any) {
+        console.warn("[add-record] Could not backfill profile from previous version:", fetchErr.message);
       }
-      if (profilePhoto.length > 8 * 1024 * 1024) {
+    } else {
+      // First record — all Profile fields are required
+      const profileFields: Record<string, string> = {
+        fullName: resolvedFullName, dateOfBirth: resolvedDateOfBirth,
+        patientEmail: resolvedPatientEmail, phone: resolvedPhone,
+        address: resolvedAddress, bloodGroup: resolvedBloodGroup,
+      };
+      for (const [key, val] of Object.entries(profileFields)) {
+        if (!val) { res.status(400).json({ error: `Missing or invalid field: ${key}` }); return; }
+      }
+      // Patient email format
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(resolvedPatientEmail)) {
+        res.status(400).json({ error: "Invalid patient email address" }); return;
+      }
+    }
+
+    // Profile photo validation (only when a new photo is supplied)
+    if (resolvedProfilePhoto && resolvedProfilePhoto.startsWith("data:image/")) {
+      if (resolvedProfilePhoto.length > 8 * 1024 * 1024) {
         res.status(400).json({ error: "Profile photo exceeds maximum size (8 MB)" }); return;
+      }
+    } else if (resolvedProfilePhoto && !resolvedProfilePhoto.startsWith("data:image/")) {
+      // Could be a carried-over base64 from previous version — allow it through
+      // Only reject if it looks like a fresh upload with a wrong prefix
+      if (profilePhoto && typeof profilePhoto === "string" && !profilePhoto.startsWith("data:image/")) {
+        res.status(400).json({ error: "Invalid profile photo format" }); return;
       }
     }
 
     const record = {
       patientId:          patientId.trim().toLowerCase(),
-      fullName:           fullName.trim(),
-      dateOfBirth:        dateOfBirth.trim(),
-      patientEmail:       patientEmail.trim().toLowerCase(),
-      phone:              phone.trim(),
-      address:            address.trim(),
-      allergies:          (allergies          || "").trim(),
-      existingConditions: (existingConditions || "").trim(),
-      bloodGroup:         bloodGroup.trim(),
+      fullName:           resolvedFullName,
+      dateOfBirth:        resolvedDateOfBirth,
+      patientEmail:       resolvedPatientEmail,
+      phone:              resolvedPhone,
+      address:            resolvedAddress,
+      allergies:          resolvedAllergies,
+      existingConditions: resolvedConditions,
+      bloodGroup:         resolvedBloodGroup,
       symptoms:           symptoms.trim(),
       diagnosis:          diagnosis.trim(),
       medication:         medication.trim(),
@@ -317,11 +377,13 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
       instructions:       instructions.trim(),
       doctorName:         doctorName.trim(),
       department:         department.trim(),
-      profilePhoto:       (profilePhoto && typeof profilePhoto === "string") ? profilePhoto : "",
+      profilePhoto:       resolvedProfilePhoto,
     };
 
     // Persist patient email for future access requests
-    await storePatientEmail(patientId.trim().toLowerCase(), patientEmail.trim().toLowerCase());
+    if (resolvedPatientEmail) {
+      await storePatientEmail(patientId.trim().toLowerCase(), resolvedPatientEmail);
+    }
 
     // Hybrid-encrypt (AES-256-CBC + RSA-2048)
     const payload: EncryptedPayload = encryptRecord(JSON.stringify(record), RSA_PUBLIC_KEY);
@@ -330,30 +392,41 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     const pinResult = await pinata.upload.public.json(payload);
     const ipfsHash  = pinResult.cid;
 
-    // Store on-chain
-    const prevHash = (previousIpfsHash && typeof previousIpfsHash === "string")
-      ? previousIpfsHash.trim() : "";
-    const tx = await contract.storeRecord(patientId.trim().toLowerCase(), ipfsHash, prevHash);
-    await tx.wait();
+    // Store on-chain — catch stale-data race condition
+    let tx: any;
+    try {
+      tx = await contract.storeRecord(patientId.trim().toLowerCase(), ipfsHash, prevHash);
+      await tx.wait();
+    } catch (contractErr: any) {
+      const reason: string = contractErr?.reason ?? contractErr?.message ?? "";
+      if (reason.includes("previousIpfsHash does not match latest record")) {
+        res.status(409).json({
+          error: "This patient's record was updated by someone else since you opened this form — please refresh and try again",
+        });
+        return;
+      }
+      throw contractErr;
+    }
+
+    // Compute encounter label (Task 4 naming) — version count after tx is the new version
+    const newVersion    = Number(await contract.getRecordCount(patientId.trim().toLowerCase()));
+    const encounterLabel = newVersion === 1 ? "Initial Record" : `Encounter ${newVersion - 1}`;
+    const pid           = patientId.trim().toLowerCase();
 
     // Email notification to hospital
     const user = res.locals.user as { email: string };
     if (user?.email) {
       try {
-        await sendRecordStoredNotification(user.email, patientId.trim().toLowerCase(), tx.hash, ipfsHash);
+        await sendRecordStoredNotification(user.email, pid, tx.hash, ipfsHash, resolvedFullName, encounterLabel);
       } catch (e: any) { console.warn("[mailer]", e.message); }
     }
 
-    // Email notification to patient — sends Tx Hash + IPFS CID so they can
-    // provide these to any hospital requesting access to their record.
-    try {
-      await sendRecordStoredNotification(
-        patientEmail.trim().toLowerCase(),
-        patientId.trim().toLowerCase(),
-        tx.hash,
-        ipfsHash
-      );
-    } catch (e: any) { console.warn("[mailer] patient notification failed:", e.message); }
+    // Email notification to patient — access is Patient-ID-based (Task 6), no hash forwarding needed
+    if (resolvedPatientEmail) {
+      try {
+        await sendRecordStoredNotification(resolvedPatientEmail, pid, tx.hash, ipfsHash, resolvedFullName, encounterLabel);
+      } catch (e: any) { console.warn("[mailer] patient notification failed:", e.message); }
+    }
 
     res.json({ success: true, txHash: tx.hash, ipfsHash });
   } catch (error: any) {
@@ -364,9 +437,10 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
 
 // ── POST /access/request ──────────────────────────────────────────────────────
 /**
- * Hospital submits valid Tx Hash + IPFS CID.
- * System verifies them, then sends an authorization email to the patient.
- * Hospital is placed in a "waiting" state — no record is returned yet.
+ * Hospital submits a patientId to request access.
+ * The backend resolves the current on-chain hash itself via getIpfsHash(),
+ * so no client-supplied txHash/ipfsCid is needed — this works correctly
+ * across multiple encounters where each version has a different hash.
  *
  * This implements the asynchronous access control model:
  *   - Decentralized data ownership (patient decides)
@@ -375,47 +449,35 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
  *   - Wait-free register write (consent state updated atomically)
  */
 app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res: Response) => {
-  const { patientId, txHash, ipfsCid } = req.body;
+  const { patientId } = req.body;
 
-  if (!patientId || !txHash || !ipfsCid) {
-    res.status(400).json({ error: "patientId, txHash and ipfsCid are required" }); return;
+  if (!patientId) {
+    res.status(400).json({ error: "patientId is required" }); return;
   }
   if (!/^[A-Za-z0-9\-]+$/.test(patientId.trim())) {
     res.status(400).json({ error: "Invalid patient ID format" }); return;
   }
 
   try {
-    // Step 1: Verify IPFS CID matches on-chain record
-    // Uses getIpfsHash (no consent required) — consent is not yet granted
-    // at this point; that happens only after the patient approves.
-    let onChainIpfs: string;
+    // Step 1: Confirm the patient record exists on-chain
+    // getIpfsHash() always returns the latest version's hash — no client hash needed.
     try {
-      onChainIpfs = await contract.getIpfsHash(patientId.trim().toLowerCase());
+      await contract.getIpfsHash(patientId.trim().toLowerCase());
     } catch (err: any) {
       if (err.reason && err.reason.includes("Record not found")) {
         res.status(404).json({ error: "Record not found on blockchain" }); return;
       }
       throw err;
     }
-    if (onChainIpfs !== ipfsCid.trim()) {
-      res.status(403).json({ error: "Invalid input details" }); return;
-    }
 
-    // Step 2: Verify Tx Hash exists on blockchain
-    const provider  = (contract.runner as any).provider as ethers.JsonRpcProvider;
-    const txReceipt = await provider.getTransaction(txHash.trim());
-    if (!txReceipt) {
-      res.status(403).json({ error: "Invalid input details" }); return;
-    }
-
-    // Step 3: Look up patient email
+    // Step 2: Look up patient email
     const patientEmail = await getPatientEmail(patientId.trim().toLowerCase());
     if (!patientEmail) {
       res.status(404).json({ error: "Patient email not found. Record may have been stored before this feature was added." });
       return;
     }
 
-    // Step 4: Create cryptographically secure access request token
+    // Step 3: Create cryptographically secure access request token
     const user    = res.locals.user as { email: string; hospitalName: string };
     const request = await createAccessRequest(
       patientId.trim().toLowerCase(),
@@ -424,12 +486,12 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
       user.email
     );
 
-    // Step 5: Write "pending" to the wait-free register for this patient
+    // Step 4: Write "pending" to the wait-free register for this patient
     // This models the asynchronous consent state update in the distributed system
     const register = getOrCreateRegister(patientId.trim().toLowerCase());
     register.write("pending", user.email);
 
-    // Step 6: Send authorization email to patient
+    // Step 5: Send authorization email to patient
     try {
       await sendPatientAuthorizationRequest(
         patientEmail,
@@ -570,6 +632,43 @@ app.get("/access/respond", async (req: Request, res: Response) => {
   }
 });
 
+// ── Shared helper: fetch + decrypt a specific version from IPFS ──────────────
+/**
+ * Fetches and decrypts a single versioned record from IPFS.
+ * Shared by GET /get-record/:id and GET /record-history/:patientId
+ * to avoid duplicating decrypt logic.
+ */
+async function fetchVersionData(patientId: string, version: number) {
+  const onChain  = await contract.getRecordVersion.staticCall(patientId, version);
+  const ipfsHash = onChain[0] as string;
+  const data     = await pinata.gateways.public.get(ipfsHash);
+  const payload  = data.data as unknown as EncryptedPayload;
+  const parsed   = JSON.parse(decryptRecord(payload, RSA_PRIVATE_KEY));
+  return {
+    patientId,
+    fullName:           parsed.fullName           || "",
+    dateOfBirth:        parsed.dateOfBirth        || "",
+    patientEmail:       parsed.patientEmail       || "",
+    phone:              parsed.phone              || "",
+    address:            parsed.address            || "",
+    allergies:          parsed.allergies          || "",
+    existingConditions: parsed.existingConditions || "",
+    bloodGroup:         parsed.bloodGroup         || "",
+    symptoms:           parsed.symptoms           || "",
+    diagnosis:          parsed.diagnosis          || "",
+    medication:         parsed.medication         || "",
+    dosage:             parsed.dosage             || "",
+    instructions:       parsed.instructions       || "",
+    doctorName:         parsed.doctorName         || "",
+    department:         parsed.department         || "",
+    profilePhoto:       parsed.profilePhoto       || "",
+    hospital:           onChain[2] as string,
+    timestamp:          (onChain[3] as bigint).toString(),
+    version:            version.toString(),
+    ipfsHash,
+  };
+}
+
 // ── GET /get-record/:id ───────────────────────────────────────────────────────
 /**
  * Returns the full decrypted patient record.
@@ -582,69 +681,28 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     res.status(400).json({ error: "Invalid or missing patient ID" }); return;
   }
 
-  const { txHash, ipfsCid } = req.query as { txHash?: string; ipfsCid?: string };
-  if (!txHash?.trim() || !ipfsCid?.trim()) {
-    res.status(400).json({ error: "txHash and ipfsCid are required" }); return;
-  }
-
-  const fetchRecord = async () => {
-    const onChain  = await contract.getRecord.staticCall(id.toLowerCase());
-    const ipfsHash = onChain[1] as string;
-    const data     = await pinata.gateways.public.get(ipfsHash);
-    const payload  = data.data as unknown as EncryptedPayload;
-    const parsed   = JSON.parse(decryptRecord(payload, RSA_PRIVATE_KEY));
-    return {
-      patientId:          onChain[0] as string,
-      fullName:           parsed.fullName           || "",
-      dateOfBirth:        parsed.dateOfBirth        || "",
-      patientEmail:       parsed.patientEmail       || "",
-      phone:              parsed.phone              || "",
-      address:            parsed.address            || "",
-      allergies:          parsed.allergies          || "",
-      existingConditions: parsed.existingConditions || "",
-      bloodGroup:         parsed.bloodGroup         || "",
-      symptoms:           parsed.symptoms           || "",
-      diagnosis:          parsed.diagnosis          || "",
-      medication:         parsed.medication         || "",
-      dosage:             parsed.dosage             || "",
-      instructions:       parsed.instructions       || "",
-      doctorName:         parsed.doctorName         || "",
-      department:         parsed.department         || "",
-      profilePhoto:       parsed.profilePhoto       || "",
-      hospital:           onChain[3] as string,
-      timestamp:          onChain[4].toString(),
-      version:            onChain[5].toString(),
-      ipfsHash,
-    };
-  };
-
   try {
-    // Verify IPFS CID using getIpfsHash (no consent required at this stage)
-    let onChainIpfs: string;
+    // Confirm record exists on-chain before fetching
     try {
-      onChainIpfs = await contract.getIpfsHash(id.toLowerCase());
+      await contract.getIpfsHash(id.toLowerCase());
     } catch (err: any) {
       if (err.reason && err.reason.includes("Record not found")) {
         res.status(404).json({ error: "Record not found on blockchain" }); return;
       }
       throw err;
     }
-    if (onChainIpfs !== ipfsCid.trim()) {
-      res.status(403).json({ error: "Invalid input details" }); return;
-    }
 
-    // Verify Tx Hash
-    const provider  = (contract.runner as any).provider as ethers.JsonRpcProvider;
-    const txReceipt = await provider.getTransaction(txHash.trim());
-    if (!txReceipt) { res.status(403).json({ error: "Invalid input details" }); return; }
+    // Use shared fetchVersionData helper — gets the latest version
+    // getRecordCount returns the current version number (latest)
+    const latestVersion = Number(await contract.getRecordCount(id.toLowerCase()));
+    const result1       = await fetchVersionData(id.toLowerCase(), latestVersion);
 
     // k-set Byzantine consensus (n=5, f=1, k=2)
     // Single-node deployment: fetch once from the authoritative source
     // (blockchain + IPFS), then replicate the response to simulate the
     // quorum of n=5 nodes agreeing. This satisfies the threshold=2
     // requirement while avoiding redundant gas-burning blockchain calls.
-    const result1 = await fetchRecord();
-    const serialised = JSON.stringify(result1);
+    const serialised     = JSON.stringify(result1);
     const attempts: string[] = [serialised, serialised]; // quorum simulation
 
     const agreed = simulateConsensus(attempts);
@@ -662,6 +720,62 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     res.json(JSON.parse(agreed[0]));
   } catch (err: any) {
     console.error("[get-record]", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── GET /record-history/:patientId ──────────────────────────────────────────
+/**
+ * Returns all encounter versions for a patient, newest first.
+ * Requires approved consent in the wait-free register (same check as get-record).
+ * Uses fetchVersionData() shared helper — no decrypt logic duplication.
+ *
+ * Each entry includes the HL7 FHIR Encounter label (Task 4 naming),
+ * timestamp, encounter fields, and IPFS CID for provenance.
+ */
+app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Response) => {
+  const pid = String(req.params.patientId).trim().toLowerCase();
+  if (!pid || pid.length > 100) {
+    res.status(400).json({ error: "Invalid patient ID" }); return;
+  }
+
+  // Consent check — same wait-free register guard used in get-record
+  const register      = getOrCreateRegister(pid);
+  const registerState = register.read(res.locals.user.email);
+  if (registerState.value !== "approved") {
+    res.status(403).json({ error: "Patient consent not confirmed in distributed register" }); return;
+  }
+
+  try {
+    const count = Number(await contract.getRecordCount(pid));
+    if (count === 0) { res.status(404).json({ error: "Record not found" }); return; }
+
+    // Fetch all versions newest-first
+    const encounters = [];
+    for (let v = count; v >= 1; v--) {
+      const entry = await fetchVersionData(pid, v);
+      // HL7 FHIR Encounter label — v1 = "Initial Record", v2+ = "Encounter N-1"
+      const label = v === 1 ? "Initial Record" : `Encounter ${v - 1}`;
+      encounters.push({
+        label,
+        version:            entry.version,
+        timestamp:          entry.timestamp,
+        ipfsHash:           entry.ipfsHash,
+        doctorName:         entry.doctorName,
+        department:         entry.department,
+        symptoms:           entry.symptoms,
+        diagnosis:          entry.diagnosis,
+        medication:         entry.medication,
+        dosage:             entry.dosage,
+        instructions:       entry.instructions,
+        allergies:          entry.allergies,
+        existingConditions: entry.existingConditions,
+      });
+    }
+
+    res.json({ patientId: pid, total: count, encounters });
+  } catch (err: any) {
+    console.error("[record-history]", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

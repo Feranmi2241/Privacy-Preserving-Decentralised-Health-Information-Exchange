@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import PatientForm from './PatientForm';
 
 interface FullRecord {
   patientId: string; fullName: string; dateOfBirth: string; patientEmail: string;
@@ -11,7 +12,15 @@ interface FullRecord {
   hospital: string; timestamp: string; version: string; ipfsHash: string;
 }
 
-type Step = 'search' | 'verify' | 'waiting' | 'result';
+interface EncounterEntry {
+  label: string; version: string; timestamp: string; ipfsHash: string;
+  doctorName: string; department: string;
+  symptoms: string; diagnosis: string;
+  medication: string; dosage: string; instructions: string;
+  allergies: string; existingConditions: string;
+}
+
+type Step = 'search' | 'waiting' | 'result';
 type AccessStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'not_found';
 
 const ACCESS_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
@@ -30,6 +39,15 @@ function formatCountdown(ms: number): string {
   const min = Math.floor(totalSec / 60).toString().padStart(2, '0');
   const sec = (totalSec % 60).toString().padStart(2, '0');
   return `${min}:${sec}`;
+}
+
+// Version label follows HL7 FHIR "Encounter" terminology — v1 is the initial
+// patient record; every subsequent version is a clinical encounter, matching
+// the Encounter resource model used in the MedicalRecord.sol header comment.
+function formatVersion(version: string | number): string {
+  const v = Number(version);
+  if (v === 1) return 'Initial Record';
+  return `Encounter ${v - 1}`;
 }
 
 function RecordSection({ icon, title, children }: { icon: string; title: string; children: React.ReactNode }) {
@@ -55,14 +73,14 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
 }
 
 export default function RecordViewer({ token }: { token: string }) {
-  const [step, setStep]         = useState<Step>('search');
+  const [step, setStep]           = useState<Step>('search');
   const [patientId, setPatientId] = useState('');
-  const [txHash, setTxHash]     = useState('');
-  const [ipfsCid, setIpfsCid]   = useState('');
-  const [loading, setLoading]   = useState(false);
-  const [record, setRecord]     = useState<FullRecord | null>(null);
-  const [error, setError]       = useState('');
-  const [modal, setModal]       = useState('');
+  const [loading, setLoading]     = useState(false);
+  const [record, setRecord]       = useState<FullRecord | null>(null);
+  const [error, setError]         = useState('');
+  const [showEncounter, setShowEncounter]   = useState(false);
+  const [history, setHistory]               = useState<EncounterEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   // Waiting page state
   const [accessStatus, setAccessStatus]     = useState<AccessStatus>('pending');
@@ -81,47 +99,33 @@ export default function RecordViewer({ token }: { token: string }) {
 
   const reset = () => {
     stopPolling();
-    setStep('search'); setPatientId(''); setTxHash(''); setIpfsCid('');
-    setRecord(null); setError(''); setModal('');
+    setStep('search'); setPatientId('');
+    setRecord(null); setError('');
     setAccessStatus('pending'); setTimeRemaining(ACCESS_TIMEOUT_MS);
     setMaskedEmail(''); setResendInfo('');
+    setShowEncounter(false); setHistory([]);
   };
 
   // Clean up on unmount
   useEffect(() => () => stopPolling(), []);
 
-  const handleSearch = (e: React.FormEvent) => {
+  // handleSearch: sends access request directly — no separate verify step
+  const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!patientId.trim()) { setError('Enter a Patient ID.'); return; }
-    setError(''); setStep('verify');
-  };
-
-  // Step 2: Verify Tx Hash + IPFS CID, then send authorization request to patient
-  const handleVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!txHash.trim() || !ipfsCid.trim()) {
-      setError('Both Tx Hash and IPFS CID are required.'); return;
-    }
     setLoading(true); setError('');
     try {
       const res = await fetch(`${import.meta.env.VITE_API_URL}/access/request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ patientId: patientId.trim(), txHash: txHash.trim(), ipfsCid: ipfsCid.trim() }),
+        body: JSON.stringify({ patientId: patientId.trim() }),
       });
       const data = await res.json();
-      if (!res.ok) {
-        if (res.status === 403 || data.error === 'Invalid input details') {
-          setModal('invalid');
-        } else {
-          throw new Error(data.error || 'Request failed');
-        }
-        return;
-      }
+      if (!res.ok) throw new Error(data.error || 'Request failed');
       setMaskedEmail(data.patientEmail || '');
       setTimeRemaining(ACCESS_TIMEOUT_MS);
       setStep('waiting');
-      startPolling(patientId.trim(), txHash.trim(), ipfsCid.trim());
+      startPolling(patientId.trim());
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -129,19 +133,19 @@ export default function RecordViewer({ token }: { token: string }) {
     }
   };
 
-  // Fetch the full record after approval — accepts explicit values to avoid stale closures
-  const fetchRecord = async (pid: string, tx: string, cid: string) => {
+  // Fetch the full record after approval — patientId only, backend resolves hash
+  const fetchRecord = async (pid: string) => {
     setLoading(true);
     try {
       const res = await fetch(
-        `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(pid)}` +
-        `?txHash=${encodeURIComponent(tx)}&ipfsCid=${encodeURIComponent(cid)}`,
+        `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(pid)}`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to retrieve record');
       setRecord(data);
       setStep('result');
+      fetchHistory(pid);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -149,8 +153,23 @@ export default function RecordViewer({ token }: { token: string }) {
     }
   };
 
-  // Poll /access/status every 5 seconds — accepts explicit values to avoid stale closures
-  const startPolling = (pid: string, tx: string, cid: string) => {
+  // Fetch full encounter history after access is approved
+  const fetchHistory = async (pid: string) => {
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(
+        `${import.meta.env.VITE_API_URL}/record-history/${encodeURIComponent(pid)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const data = await res.json();
+      if (res.ok) setHistory(data.encounters || []);
+    } catch { /* non-fatal */ } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  // Poll /access/status every 5 seconds
+  const startPolling = (pid: string) => {
     stopPolling();
 
     // Countdown timer
@@ -175,7 +194,7 @@ export default function RecordViewer({ token }: { token: string }) {
 
         if (status === 'approved') {
           stopPolling();
-          await fetchRecord(pid, tx, cid);
+          await fetchRecord(pid);
         } else if (status === 'denied' || status === 'expired') {
           stopPolling();
         }
@@ -190,14 +209,14 @@ export default function RecordViewer({ token }: { token: string }) {
       const res = await fetch(`${import.meta.env.VITE_API_URL}/access/request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ patientId: patientId.trim(), txHash: txHash.trim(), ipfsCid: ipfsCid.trim() }),
+        body: JSON.stringify({ patientId: patientId.trim() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Resend failed');
       setResendInfo('A new authorization request has been sent to the patient.');
       setAccessStatus('pending');
       setTimeRemaining(ACCESS_TIMEOUT_MS);
-      startPolling(patientId.trim(), txHash.trim(), ipfsCid.trim());
+      startPolling(patientId.trim());
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -211,25 +230,11 @@ export default function RecordViewer({ token }: { token: string }) {
   return (
     <div className="fade-in">
 
-      {/* ── Invalid details modal ── */}
-      {modal === 'invalid' && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div className="card" style={{ maxWidth: 380, width: '90%', textAlign: 'center', animation: 'fadeIn 0.3s ease' }}>
-            <div style={{ fontSize: '2.5rem', marginBottom: 12 }}>🚫</div>
-            <div className="card-title" style={{ justifyContent: 'center', color: 'var(--error)' }}>Invalid Input Details</div>
-            <p style={{ color: 'var(--muted)', fontSize: '0.85rem', margin: '10px 0 20px' }}>
-              The Tx Hash or IPFS CID you entered does not match the record for this Patient ID. Please verify and try again.
-            </p>
-            <button className="btn btn-primary" onClick={() => setModal('')}>Try Again</button>
-          </div>
-        </div>
-      )}
-
       {/* ── Step 1: Search ── */}
       {step === 'search' && (
         <div className="card" style={{ marginBottom: 20 }}>
           <div className="card-title"><span>🔍</span> Retrieve Patient Record</div>
-          <p className="card-subtitle">Enter a Patient ID to begin the secure authorization process</p>
+          <p className="card-subtitle">Enter a Patient ID to send an authorization request to the patient</p>
           <form onSubmit={handleSearch} style={{ display: 'flex', gap: 10 }}>
             <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
               <input
@@ -239,61 +244,15 @@ export default function RecordViewer({ token }: { token: string }) {
                 autoComplete="off"
               />
             </div>
-            <button className="btn btn-secondary" type="submit" style={{ width: 'auto', padding: '12px 22px', whiteSpace: 'nowrap' }}>
-              🔎 Fetch
+            <button className="btn btn-primary" type="submit" disabled={loading} style={{ width: 'auto', padding: '12px 22px', whiteSpace: 'nowrap' }}>
+              {loading ? <><span className="spinner" /> Sending...</> : '📨 Request Access'}
             </button>
           </form>
           {error && <div className="alert alert-error" style={{ marginTop: 14 }}><span className="alert-icon">⚠️</span><div className="alert-body">{error}</div></div>}
         </div>
       )}
 
-      {/* ── Step 2: Verify ── */}
-      {step === 'verify' && (
-        <div className="card slide-in" style={{ marginBottom: 20 }}>
-          <div className="card-title"><span>🔐</span> Verify Record Access</div>
-          <p className="card-subtitle">
-            Enter the <strong style={{ color: 'var(--text)' }}>Tx Hash</strong> and{' '}
-            <strong style={{ color: 'var(--text)' }}>IPFS CID</strong> from your confirmation email.
-            The system will then send an authorization request to the patient.
-          </p>
-
-          <div style={{ padding: '10px 14px', background: 'rgba(99,102,241,0.08)', borderRadius: 8, border: '1px solid rgba(99,102,241,0.2)', fontSize: '0.8rem', color: '#a5b4fc', marginBottom: 20 }}>
-            🔒 Querying record for Patient ID: <strong>{patientId}</strong>
-          </div>
-
-          <form onSubmit={handleVerify}>
-            <div className="form-group">
-              <label>Transaction Hash <span style={{ color: 'var(--error)' }}>*</span></label>
-              <input
-                value={txHash}
-                onChange={e => { setTxHash(e.target.value); setError(''); }}
-                placeholder="0x..."
-                autoComplete="off"
-                style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
-              />
-            </div>
-            <div className="form-group">
-              <label>IPFS CID <span style={{ color: 'var(--error)' }}>*</span></label>
-              <input
-                value={ipfsCid}
-                onChange={e => { setIpfsCid(e.target.value); setError(''); }}
-                placeholder="Qm... or bafy..."
-                autoComplete="off"
-                style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}
-              />
-            </div>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button className="btn btn-secondary" type="button" onClick={reset} style={{ flex: '0 0 auto', width: 'auto', padding: '12px 20px' }}>← Back</button>
-              <button className="btn btn-primary" type="submit" disabled={loading} style={{ flex: 1 }}>
-                {loading ? <><span className="spinner" /> Sending Request...</> : '📨 Send Authorization Request'}
-              </button>
-            </div>
-          </form>
-          {error && <div className="alert alert-error" style={{ marginTop: 14 }}><span className="alert-icon">⚠️</span><div className="alert-body">{error}</div></div>}
-        </div>
-      )}
-
-      {/* ── Step 3: Waiting for patient authorization ── */}
+      {/* ── Step 2: Waiting for patient authorization ── */}
       {step === 'waiting' && (
         <div className="card slide-in" style={{ marginBottom: 20, textAlign: 'center' }}>
 
@@ -414,7 +373,41 @@ export default function RecordViewer({ token }: { token: string }) {
         </div>
       )}
 
-      {/* ── Step 4: Full Record ── */}
+      {/* ── Add Encounter overlay ── */}
+      {showEncounter && record && (
+        <div style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.75)',
+          display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+          zIndex: 1000, overflowY: 'auto', padding: '32px 16px',
+        }}>
+          <div style={{ width: '100%', maxWidth: 720, position: 'relative' }}>
+            <button
+              onClick={() => setShowEncounter(false)}
+              style={{
+                position: 'absolute', top: -12, right: -12, zIndex: 10,
+                width: 32, height: 32, borderRadius: '50%',
+                background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)',
+                color: '#fca5a5', fontSize: '1rem', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            >✕</button>
+            <PatientForm
+              token={token}
+              encounterContext={{
+                patientId: record.patientId,
+                previousIpfsHash: record.ipfsHash,
+              }}
+              onRecordAdded={() => {
+                setShowEncounter(false);
+                fetchRecord(record.patientId);
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* ── Step 3: Full Record ── */}
       {step === 'result' && record && (
         <div className="record-card slide-in">
           <div className="record-header">
@@ -429,7 +422,16 @@ export default function RecordViewer({ token }: { token: string }) {
             </div>
             <div style={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
               <span className="badge badge-success">✓ On-Chain</span>
-              <button className="auth-link" style={{ fontSize: '0.75rem' }} onClick={reset}>← New Search</button>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button
+                  className="btn btn-primary"
+                  style={{ fontSize: '0.75rem', padding: '6px 14px', width: 'auto' }}
+                  onClick={() => setShowEncounter(true)}
+                >
+                  🔄 Add Encounter
+                </button>
+                <button className="auth-link" style={{ fontSize: '0.75rem' }} onClick={reset}>← New Search</button>
+              </div>
             </div>
           </div>
 
@@ -437,7 +439,7 @@ export default function RecordViewer({ token }: { token: string }) {
             <div style={{ padding: '10px 14px', background: 'rgba(59,130,246,0.07)', borderRadius: 8, border: '1px solid rgba(59,130,246,0.15)', marginBottom: 20, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span style={{ fontSize: '0.78rem', color: 'var(--muted)' }}>🕐 Record stored on:</span>
               <span style={{ fontSize: '0.85rem', color: '#93c5fd', fontWeight: 600 }}>{formatDate(record.timestamp)}</span>
-              <span className="badge badge-info" style={{ marginLeft: 'auto' }}>v{record.version}</span>
+              <span className="badge badge-info" style={{ marginLeft: 'auto' }}>{formatVersion(record.version)}</span>
             </div>
 
             <RecordSection icon="🪪" title="Patient Identification">
@@ -485,6 +487,136 @@ export default function RecordViewer({ token }: { token: string }) {
               <Field label="Hospital Address (Wallet)" value={record.hospital} mono />
               <Field label="IPFS CID"                  value={record.ipfsHash}  mono />
             </RecordSection>
+
+            {/* ── Encounter History Timeline ── */}
+            <div style={{ marginTop: 32 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                marginBottom: 16, paddingBottom: 8,
+                borderBottom: '1px solid var(--border)',
+              }}>
+                <span>📋</span>
+                <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--muted)' }}>
+                  Encounter History
+                </span>
+                <span style={{ marginLeft: 'auto', fontSize: '0.72rem', color: 'var(--muted)' }}>
+                  {history.length > 0 ? `${history.length} record${history.length > 1 ? 's' : ''}` : ''}
+                </span>
+              </div>
+
+              {historyLoading && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {[1, 2].map(i => (
+                    <div key={i} style={{
+                      height: 80, borderRadius: 12,
+                      background: 'linear-gradient(90deg,rgba(255,255,255,0.04) 25%,rgba(255,255,255,0.08) 50%,rgba(255,255,255,0.04) 75%)',
+                      backgroundSize: '400px 100%',
+                      animation: 'shimmer 1.4s infinite',
+                    }} />
+                  ))}
+                </div>
+              )}
+
+              {!historyLoading && history.map((enc, idx) => (
+                <div key={enc.ipfsHash} style={{
+                  position: 'relative',
+                  paddingLeft: 24,
+                  marginBottom: idx < history.length - 1 ? 0 : 0,
+                }}>
+                  {/* Timeline connector line */}
+                  {idx < history.length - 1 && (
+                    <div style={{
+                      position: 'absolute', left: 7, top: 28,
+                      width: 2, bottom: -8,
+                      background: 'rgba(255,255,255,0.08)',
+                    }} />
+                  )}
+                  {/* Timeline dot */}
+                  <div style={{
+                    position: 'absolute', left: 0, top: 16,
+                    width: 14, height: 14, borderRadius: '50%',
+                    background: idx === 0 ? 'var(--accent)' : 'rgba(255,255,255,0.15)',
+                    border: `2px solid ${idx === 0 ? 'var(--accent)' : 'rgba(255,255,255,0.2)'}`,
+                    flexShrink: 0,
+                  }} />
+
+                  <div style={{
+                    background: 'var(--surface2)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 12,
+                    padding: '14px 16px',
+                    marginBottom: 8,
+                  }}>
+                    {/* Card header */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+                      <span style={{
+                        fontSize: '0.72rem', fontWeight: 700,
+                        background: idx === 0 ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.06)',
+                        color: idx === 0 ? 'var(--accent)' : 'var(--muted)',
+                        padding: '3px 10px', borderRadius: 20,
+                        border: `1px solid ${idx === 0 ? 'rgba(59,130,246,0.3)' : 'rgba(255,255,255,0.1)'}`,
+                      }}>
+                        {enc.label}
+                      </span>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--muted)', marginLeft: 'auto' }}>
+                        {formatDate(enc.timestamp)}
+                      </span>
+                    </div>
+
+                    {/* Doctor + department */}
+                    <div style={{ display: 'flex', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '0.8rem', color: 'var(--text)', fontWeight: 600 }}>
+                        👨‍⚕️ {enc.doctorName}
+                      </span>
+                      {enc.department && (
+                        <span style={{ fontSize: '0.78rem', color: 'var(--muted)' }}>
+                          · {enc.department}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Clinical fields */}
+                    {enc.symptoms && (
+                      <div className="record-field">
+                        <span className="field-label">Symptoms</span>
+                        <span className="field-value">{enc.symptoms}</span>
+                      </div>
+                    )}
+                    <div className="record-field">
+                      <span className="field-label">🩺 Diagnosis</span>
+                      <span className="field-value diagnosis">{enc.diagnosis}</span>
+                    </div>
+                    <div className="record-field">
+                      <span className="field-label">💊 Medication</span>
+                      <span className="field-value">{enc.medication} — {enc.dosage}</span>
+                    </div>
+                    {enc.instructions && (
+                      <div className="record-field">
+                        <span className="field-label">Instructions</span>
+                        <span className="field-value">{enc.instructions}</span>
+                      </div>
+                    )}
+                    {enc.allergies && (
+                      <div className="record-field">
+                        <span className="field-label">Allergies</span>
+                        <span className="field-value">{enc.allergies}</span>
+                      </div>
+                    )}
+                    {enc.existingConditions && (
+                      <div className="record-field">
+                        <span className="field-label">Conditions</span>
+                        <span className="field-value">{enc.existingConditions}</span>
+                      </div>
+                    )}
+
+                    {/* IPFS provenance */}
+                    <div style={{ marginTop: 8, fontSize: '0.68rem', color: 'var(--muted)', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                      ⛓ {enc.ipfsHash}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
