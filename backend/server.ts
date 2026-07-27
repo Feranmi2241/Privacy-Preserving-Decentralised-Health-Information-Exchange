@@ -9,6 +9,7 @@ const REQUIRED_ENV: string[] = [
   "PINATA_JWT", "PINATA_GATEWAY",
   "RSA_PUBLIC_KEY", "RSA_PRIVATE_KEY",
   "SESSION_SECRET",
+  "DB_ENCRYPTION_KEY", "DB_HASH_KEY",
 ];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length > 0) {
@@ -42,7 +43,7 @@ import rateLimit  from "express-rate-limit";
 import { PinataSDK } from "pinata";
 import { ethers }    from "ethers";
 import contract      from "./blockchain";
-import { encryptRecord, decryptRecord, EncryptedPayload } from "./encryption";
+import { encryptRecord, decryptRecord, EncryptedPayload, generateRSAKeyPair } from "./encryption";
 import simulateConsensus from "./consensusSimulation";
 import { getOrCreateRegister, getRegisterHistory } from "./waitFreeRegister";
 import {
@@ -51,7 +52,8 @@ import {
   storePatientEmail, getPatientEmail,
   createAccessRequest, consumeAccessToken,
   checkAccessStatus, getAccessRequestTimeRemaining,
-  initializeDatabase,
+  initializeDatabase, updateHospitalPublicKey,
+  getHospitalPublicKey, getApprovedHospitalsForPatient,
 } from "./dbPostgres";
 import {
   sendSignupOTP, sendForgotOTP, sendRecordStoredNotification,
@@ -168,7 +170,19 @@ app.post("/auth/verify-otp", otpLimiter, async (req: Request, res: Response) => 
     res.status(400).json({ error: "Invalid or expired OTP" }); return;
   }
   await markVerified(email);
-  res.json({ message: "Email verified" });
+
+  // Generate a per-hospital RSA keypair at the moment the account is confirmed.
+  // The public key is stored in the DB for encrypting this hospital's records.
+  // The private key is returned ONCE here and never stored — the hospital must
+  // save it immediately; it cannot be recovered if lost.
+  const { publicKey, privateKey } = generateRSAKeyPair();
+  await updateHospitalPublicKey(email, publicKey);
+
+  res.json({
+    message:      "Email verified",
+    rsaPrivateKey: privateKey,
+    keyWarning:   "Save this private key somewhere safe right now — it will never be shown again, and you will need it to view any patient record you're given access to.",
+  });
 });
 // ── POST /auth/login ──────────────────────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req: Request, res: Response) => {
@@ -267,6 +281,7 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
       doctorName, department,
       profilePhoto, previousIpfsHash,
       allergiesUnchanged, conditionsUnchanged,
+      rsaPrivateKey,
     } = req.body;
 
     const keepAllergies   = allergiesUnchanged   === true || allergiesUnchanged   === "true";
@@ -282,6 +297,11 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
 
     const isAmendment = typeof previousIpfsHash === "string" && previousIpfsHash.trim().length > 0;
     const prevHash    = isAmendment ? previousIpfsHash.trim() : "";
+
+    // Private key required for amendments — needed to decrypt previous version for profile backfill
+    if (isAmendment && (!rsaPrivateKey || typeof rsaPrivateKey !== "string")) {
+      res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
+    }
 
     // Encounter fields are required on every submission (first record AND amendment)
     const encounterFields: Record<string, string> = {
@@ -315,7 +335,7 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
         const prevIpfsHash = prevOnChain[0] as string;
         const prevData     = await pinata.gateways.public.get(prevIpfsHash);
         const prevPayload  = prevData.data as unknown as EncryptedPayload;
-        const prevParsed   = JSON.parse(decryptRecord(prevPayload, RSA_PRIVATE_KEY));
+        const prevParsed   = JSON.parse(decryptRecord(prevPayload, rsaPrivateKey, res.locals.user.email));
 
         if (!resolvedFullName)     resolvedFullName     = prevParsed.fullName     || "";
         if (!resolvedDateOfBirth)  resolvedDateOfBirth  = prevParsed.dateOfBirth  || "";
@@ -385,8 +405,23 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
       await storePatientEmail(patientId.trim().toLowerCase(), resolvedPatientEmail);
     }
 
-    // Hybrid-encrypt (AES-256-CBC + RSA-2048)
-    const payload: EncryptedPayload = encryptRecord(JSON.stringify(record), RSA_PUBLIC_KEY);
+    // Hybrid-encrypt (AES-256-GCM + RSA-OAEP) for every consented hospital
+    // Build publicKeys map: submitting hospital + every previously approved hospital
+    const submittingEmail = res.locals.user.email as string;
+    const approvedEmails  = await getApprovedHospitalsForPatient(patientId.trim().toLowerCase());
+    const allEmails       = Array.from(new Set([submittingEmail, ...approvedEmails]));
+
+    const publicKeys: Record<string, string> = {};
+    for (const email of allEmails) {
+      const pubKey = await getHospitalPublicKey(email);
+      if (!pubKey) {
+        console.warn(`[add-record] Skipping encryptedKey for ${email} — no rsa_public_key on file (pre-phase-1 account, see MIGRATION_NOTE.md)`);
+        continue;
+      }
+      publicKeys[email] = pubKey;
+    }
+
+    const payload: EncryptedPayload = encryptRecord(JSON.stringify(record), publicKeys);
 
     // Pin to IPFS
     const pinResult = await pinata.upload.public.json(payload);
@@ -638,12 +673,18 @@ app.get("/access/respond", async (req: Request, res: Response) => {
  * Shared by GET /get-record/:id and GET /record-history/:patientId
  * to avoid duplicating decrypt logic.
  */
-async function fetchVersionData(patientId: string, version: number) {
+async function fetchVersionData(patientId: string, version: number, hospitalEmail: string, privateKey: string) {
   const onChain  = await contract.getRecordVersion.staticCall(patientId, version);
   const ipfsHash = onChain[0] as string;
   const data     = await pinata.gateways.public.get(ipfsHash);
   const payload  = data.data as unknown as EncryptedPayload;
-  const parsed   = JSON.parse(decryptRecord(payload, RSA_PRIVATE_KEY));
+  let parsed: any;
+  try {
+    parsed = JSON.parse(decryptRecord(payload, privateKey, hospitalEmail));
+  } catch (err: any) {
+    if (err.message === "NO_KEY_FOR_HOSPITAL") throw err; // propagate — caller handles as 403
+    throw err; // any other decrypt failure (bad key, tampered data) also propagates
+  }
   return {
     patientId,
     fullName:           parsed.fullName           || "",
@@ -681,6 +722,11 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     res.status(400).json({ error: "Invalid or missing patient ID" }); return;
   }
 
+  const { rsaPrivateKey } = req.body;
+  if (!rsaPrivateKey || typeof rsaPrivateKey !== "string") {
+    res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
+  }
+
   try {
     // Confirm record exists on-chain before fetching
     try {
@@ -695,7 +741,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
     // Use shared fetchVersionData helper — gets the latest version
     // getRecordCount returns the current version number (latest)
     const latestVersion = Number(await contract.getRecordCount(id.toLowerCase()));
-    const result1       = await fetchVersionData(id.toLowerCase(), latestVersion);
+    const result1       = await fetchVersionData(id.toLowerCase(), latestVersion, res.locals.user.email, rsaPrivateKey);
 
     // k-set Byzantine consensus (n=5, f=1, k=2)
     // Single-node deployment: fetch once from the authoritative source
@@ -719,6 +765,9 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
 
     res.json(JSON.parse(agreed[0]));
   } catch (err: any) {
+    if (err.message === "NO_KEY_FOR_HOSPITAL") {
+      res.status(403).json({ error: "No decryption key on file for your hospital account — your account may pre-date the per-hospital key upgrade. Contact the system administrator." }); return;
+    }
     console.error("[get-record]", err);
     res.status(500).json({ error: "Internal server error" });
   }
@@ -739,6 +788,11 @@ app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Res
     res.status(400).json({ error: "Invalid patient ID" }); return;
   }
 
+  const { rsaPrivateKey } = req.body;
+  if (!rsaPrivateKey || typeof rsaPrivateKey !== "string") {
+    res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
+  }
+
   // Consent check — same wait-free register guard used in get-record
   const register      = getOrCreateRegister(pid);
   const registerState = register.read(res.locals.user.email);
@@ -753,7 +807,7 @@ app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Res
     // Fetch all versions newest-first
     const encounters = [];
     for (let v = count; v >= 1; v--) {
-      const entry = await fetchVersionData(pid, v);
+      const entry = await fetchVersionData(pid, v, res.locals.user.email, rsaPrivateKey);
       // HL7 FHIR Encounter label — v1 = "Initial Record", v2+ = "Encounter N-1"
       const label = v === 1 ? "Initial Record" : `Encounter ${v - 1}`;
       encounters.push({
@@ -775,6 +829,9 @@ app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Res
 
     res.json({ patientId: pid, total: count, encounters });
   } catch (err: any) {
+    if (err.message === "NO_KEY_FOR_HOSPITAL") {
+      res.status(403).json({ error: "No decryption key on file for your hospital account — your account may pre-date the per-hospital key upgrade. Contact the system administrator." }); return;
+    }
     console.error("[record-history]", err);
     res.status(500).json({ error: "Internal server error" });
   }

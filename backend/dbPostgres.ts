@@ -65,7 +65,8 @@ export async function initializeDatabase(): Promise<void> {
         password_hash VARCHAR(255) NOT NULL,
         password_history TEXT[] DEFAULT '{}',
         verified BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP DEFAULT NOW(),
+        rsa_public_key TEXT
       )
     `);
 
@@ -93,6 +94,7 @@ export async function initializeDatabase(): Promise<void> {
         patient_email VARCHAR(255) NOT NULL,
         hospital_name VARCHAR(255) NOT NULL,
         hospital_email VARCHAR(255) NOT NULL,
+        hospital_email_hash VARCHAR(64),
         expires_at BIGINT NOT NULL,
         status VARCHAR(10) NOT NULL DEFAULT 'pending',
         created_at BIGINT NOT NULL
@@ -111,6 +113,46 @@ export async function initializeDatabase(): Promise<void> {
 const BCRYPT_ROUNDS = 12;
 const OTP_TTL_MS = 10 * 60 * 1000;
 const ACCESS_REQUEST_TTL = 20 * 60 * 1000;
+
+// Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+function hashForLookup(value: string): string {
+  // Deterministic one-way HMAC-SHA256 fingerprint — used for WHERE-clause lookups
+  // on encrypted columns. NOT reversible. Separate key from DB_ENCRYPTION_KEY.
+  return crypto.createHmac("sha256", process.env.DB_HASH_KEY!).update(value.toLowerCase()).digest("hex");
+}
+
+// ── Column-level encryption helpers (AES-256-GCM) ────────────────────────────
+// Used to encrypt PII columns (emails) at rest in Postgres.
+// Requires DB_ENCRYPTION_KEY env var: 64 hex chars = 32 bytes.
+// Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+function getColumnKey(): Buffer {
+  const hex = process.env.DB_ENCRYPTION_KEY ?? "";
+  if (hex.length !== 64) {
+    throw new Error("[DB] DB_ENCRYPTION_KEY must be 64 hex characters (32 bytes)");
+  }
+  return Buffer.from(hex, "hex");
+}
+
+export function encryptColumn(plaintext: string): string {
+  const key = getColumnKey();
+  const iv  = crypto.randomBytes(12); // 96-bit IV standard for GCM
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const authTag   = cipher.getAuthTag(); // 16-byte tag
+  // Format: "iv:authTag:ciphertext" — all hex, colon-delimited, stored as single TEXT column
+  return `${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+export function decryptColumn(stored: string): string {
+  const [ivHex, authTagHex, ciphertextHex] = stored.split(":");
+  const key        = getColumnKey();
+  const iv         = Buffer.from(ivHex,         "hex");
+  const authTag    = Buffer.from(authTagHex,    "hex");
+  const ciphertext = Buffer.from(ciphertextHex, "hex");
+  const decipher   = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+  return decipher.update(ciphertext).toString("utf8") + decipher.final("utf8");
+}
 
 // ── Password helpers ──────────────────────────────────────────────────────────
 export async function hashPassword(plain: string): Promise<string> {
@@ -194,13 +236,60 @@ export async function updatePassword(email: string, newPlain: string): Promise<v
   }
 }
 
+export async function updateHospitalPublicKey(email: string, publicKey: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE hospitals SET rsa_public_key = $1 WHERE email = $2",
+      [publicKey, email.toLowerCase()]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getHospitalPublicKey(email: string): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT rsa_public_key FROM hospitals WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    return result.rows.length > 0 ? (result.rows[0].rsa_public_key ?? null) : null;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Returns the decrypted hospital emails of every hospital with an approved
+ * access_request row for this patient. Used by /add-record to build the
+ * full encryptedKeys map so every consented hospital can decrypt the record.
+ * hospital_email is stored encrypted (Task 4) — each row is decrypted here.
+ */
+export async function getApprovedHospitalsForPatient(patientId: string): Promise<string[]> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT DISTINCT hospital_email FROM access_requests WHERE patient_id = $1 AND status = 'approved'",
+      [patientId.toLowerCase()]
+    );
+    return result.rows.map((row: { hospital_email: string }) => {
+      try { return decryptColumn(row.hospital_email); }
+      catch { return row.hospital_email; } // fallback: pre-encryption rows stored plain
+    });
+  } finally {
+    client.release();
+  }
+}
+
 // ── Patient email store ───────────────────────────────────────────────────────
 export async function storePatientEmail(patientId: string, email: string): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(
       "INSERT INTO patient_emails (patient_id, email) VALUES ($1, $2) ON CONFLICT (patient_id) DO UPDATE SET email = $2",
-      [patientId.toLowerCase(), email.toLowerCase()]
+      [patientId.toLowerCase(), encryptColumn(email.toLowerCase())]
     );
   } finally {
     client.release();
@@ -214,7 +303,9 @@ export async function getPatientEmail(patientId: string): Promise<string | undef
       "SELECT email FROM patient_emails WHERE patient_id = $1",
       [patientId.toLowerCase()]
     );
-    return result.rows.length > 0 ? result.rows[0].email : undefined;
+    if (result.rows.length === 0) return undefined;
+    try { return decryptColumn(result.rows[0].email); }
+    catch { return result.rows[0].email; } // fallback: pre-encryption rows stored plain
   } finally {
     client.release();
   }
@@ -265,17 +356,17 @@ export async function createAccessRequest(
   try {
     await client.query(
       `UPDATE access_requests SET status = 'expired'
-       WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'`,
-      [patientId, hospitalEmail.toLowerCase()]
+       WHERE patient_id = $1 AND hospital_email_hash = $2 AND status = 'pending'`,
+      [patientId, hashForLookup(hospitalEmail.toLowerCase())]
     );
     const token = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
     const expiresAt = now + ACCESS_REQUEST_TTL;
     await client.query(
       `INSERT INTO access_requests
-         (token, patient_id, patient_email, hospital_name, hospital_email, expires_at, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)`,
-      [token, patientId, patientEmail.toLowerCase(), hospitalName, hospitalEmail.toLowerCase(), expiresAt, now]
+         (token, patient_id, patient_email, hospital_name, hospital_email, hospital_email_hash, expires_at, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8)`,
+      [token, patientId, encryptColumn(patientEmail.toLowerCase()), hospitalName, encryptColumn(hospitalEmail.toLowerCase()), hashForLookup(hospitalEmail.toLowerCase()), expiresAt, now]
     );
     return {
       token, patientId,
@@ -302,9 +393,9 @@ export async function consumeAccessToken(token: string, action: "approved" | "de
     return {
       token: row.token,
       patientId: row.patient_id,
-      patientEmail: row.patient_email,
+      patientEmail: (() => { try { return decryptColumn(row.patient_email); } catch { return row.patient_email; } })(),
       hospitalName: row.hospital_name,
-      hospitalEmail: row.hospital_email,
+      hospitalEmail: (() => { try { return decryptColumn(row.hospital_email); } catch { return row.hospital_email; } })(),
       expiresAt: Number(row.expires_at),
       status: action,
       createdAt: Number(row.created_at),
@@ -317,17 +408,17 @@ export async function checkAccessStatus(patientId: string, hospitalEmail: string
   try {
     const result = await client.query(
       `SELECT status, expires_at FROM access_requests
-       WHERE patient_id = $1 AND hospital_email = $2
+       WHERE patient_id = $1 AND hospital_email_hash = $2
        ORDER BY created_at DESC LIMIT 1`,
-      [patientId, hospitalEmail.toLowerCase()]
+      [patientId, hashForLookup(hospitalEmail.toLowerCase())]
     );
     if (result.rows.length === 0) return "not_found";
     const { status, expires_at } = result.rows[0];
     if (status === "pending" && Date.now() > Number(expires_at)) {
       await client.query(
         `UPDATE access_requests SET status = 'expired'
-         WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'`,
-        [patientId, hospitalEmail.toLowerCase()]
+         WHERE patient_id = $1 AND hospital_email_hash = $2 AND status = 'pending'`,
+        [patientId, hashForLookup(hospitalEmail.toLowerCase())]
       );
       return "expired";
     }
@@ -340,9 +431,9 @@ export async function getAccessRequestTimeRemaining(patientId: string, hospitalE
   try {
     const result = await client.query(
       `SELECT expires_at FROM access_requests
-       WHERE patient_id = $1 AND hospital_email = $2 AND status = 'pending'
+       WHERE patient_id = $1 AND hospital_email_hash = $2 AND status = 'pending'
        ORDER BY created_at DESC LIMIT 1`,
-      [patientId, hospitalEmail.toLowerCase()]
+      [patientId, hashForLookup(hospitalEmail.toLowerCase())]
     );
     if (result.rows.length === 0) return 0;
     return Math.max(0, Number(result.rows[0].expires_at) - Date.now());
