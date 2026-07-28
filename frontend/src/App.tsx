@@ -192,16 +192,18 @@ export default function App() {
   // Persist token in sessionStorage so page refresh doesn't force re-login
   const [token, setToken]               = useState(() => sessionStorage.getItem('cl_token') || '');
   const [hospitalName, setHospitalName] = useState(() => sessionStorage.getItem('cl_hospital') || '');
+  const [rsaKey, setRsaKey]             = useState('');
   const [tab, setTab]                   = useState<Tab>('add');
   const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [network, setNetwork]           = useState<NetworkStatus | null>(null);
   const [recentIds, setRecentIds]       = useState<string[]>([]);
 
-  const handleAuth = (t: string, h: string) => {
+  const handleAuth = (t: string, h: string, rsa: string) => {
     sessionStorage.setItem('cl_token', t);
     sessionStorage.setItem('cl_hospital', h);
     setToken(t);
     setHospitalName(h);
+    if (rsa) setRsaKey(rsa);
   };
 
   const handleSignOut = () => {
@@ -209,6 +211,7 @@ export default function App() {
     sessionStorage.removeItem('cl_hospital');
     setToken('');
     setHospitalName('');
+    setRsaKey('');
   };
 
   // Fetch real network status from blockchain
@@ -321,8 +324,8 @@ export default function App() {
             <div className="ds-bento-main">
               <div className="ds-bento-main-blob" />
               <div className="ds-tab-content">
-                {tab === 'add'  && <PatientForm token={token} onRecordAdded={fetchRecentIds} />}
-                {tab === 'view' && <RecordViewer token={token} />}
+                {tab === 'add'  && <PatientForm token={token} rsaKey={rsaKey} onRsaKey={setRsaKey} onRecordAdded={fetchRecentIds} />}
+                {tab === 'view' && <RecordViewer token={token} rsaKey={rsaKey} onRsaKey={setRsaKey} />}
                 {tab === 'all'  && <AllPatients token={token} />}
               </div>
             </div>

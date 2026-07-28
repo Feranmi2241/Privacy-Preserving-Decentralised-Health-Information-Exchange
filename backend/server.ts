@@ -10,6 +10,7 @@ const REQUIRED_ENV: string[] = [
   "RSA_PUBLIC_KEY", "RSA_PRIVATE_KEY",
   "SESSION_SECRET",
   "DB_ENCRYPTION_KEY", "DB_HASH_KEY",
+  "ADMIN_SECRET",
 ];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length > 0) {
@@ -42,7 +43,12 @@ import crypto     from "crypto";
 import rateLimit  from "express-rate-limit";
 import { PinataSDK } from "pinata";
 import { ethers }    from "ethers";
-import contract      from "./blockchain";
+import contract, { provider } from "./blockchain";
+import { keccak256, toUtf8Bytes } from "ethers";
+
+function hashPatientId(patientId: string): string {
+  return keccak256(toUtf8Bytes(patientId.trim().toLowerCase()));
+}
 import { encryptRecord, decryptRecord, EncryptedPayload, generateRSAKeyPair } from "./encryption";
 import simulateConsensus from "./consensusSimulation";
 import { getOrCreateRegister, getRegisterHistory } from "./waitFreeRegister";
@@ -54,6 +60,12 @@ import {
   checkAccessStatus, getAccessRequestTimeRemaining,
   initializeDatabase, updateHospitalPublicKey,
   getHospitalPublicKey, getApprovedHospitalsForPatient,
+  updateHospitalWalletAddress, getHospitalWalletAddress,
+  markHospitalRevoked,
+  deletePatientEmail,
+  createPendingSubmission, completePendingSubmission,
+  cancelPendingSubmission, expireStaleSubmissions,
+  getHospitalNameByWallet,
 } from "./dbPostgres";
 import {
   sendSignupOTP, sendForgotOTP, sendRecordStoredNotification,
@@ -132,7 +144,15 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const decoded = token ? verifyToken(token) : null;
   if (!decoded) { res.status(401).json({ error: "Unauthorised" }); return; }
   res.locals.user = decoded;
-  next();
+  // Check revoked flag on every authenticated request
+  findHospital(decoded.email).then((hospital) => {
+    if (!hospital || hospital.revoked) {
+      res.status(403).json({ error: "This hospital's access has been revoked" }); return;
+    }
+    next();
+  }).catch(() => {
+    res.status(500).json({ error: "Internal server error" });
+  });
 }
 
 // ── POST /auth/register ───────────────────────────────────────────────────────
@@ -228,7 +248,64 @@ app.post("/auth/reset-password", otpLimiter, async (req: Request, res: Response)
   res.json({ message: "Password reset successful" });
 });
 
-// ── POST /admin/verify-email (temporary) ────────────────────────────────────
+// ── Wallet nonce store (in-memory, TTL 5 min) ───────────────────────────────
+const walletNonces = new Map<string, { nonce: string; expiresAt: number }>();
+
+// ── POST /auth/wallet-nonce ───────────────────────────────────────────────────
+app.post("/auth/wallet-nonce", requireAuth, async (req: Request, res: Response) => {
+  const email = (res.locals.user as { email: string }).email;
+  const nonce = crypto.randomBytes(16).toString("hex");
+  walletNonces.set(email, { nonce, expiresAt: Date.now() + 5 * 60 * 1000 });
+  res.json({ message: `Sign this message to link your wallet to ${email}. Nonce: ${nonce}` });
+});
+
+// ── POST /auth/wallet-verify ──────────────────────────────────────────────────
+app.post("/auth/wallet-verify", requireAuth, async (req: Request, res: Response) => {
+  const email = (res.locals.user as { email: string }).email;
+  const { walletAddress, signature } = req.body;
+
+  if (!walletAddress || !signature) {
+    res.status(400).json({ error: "walletAddress and signature are required" }); return;
+  }
+
+  const stored = walletNonces.get(email);
+  if (!stored || Date.now() > stored.expiresAt) {
+    walletNonces.delete(email);
+    res.status(401).json({ error: "Nonce expired or not found — request a new one" }); return;
+  }
+
+  const message = `Sign this message to link your wallet to ${email}. Nonce: ${stored.nonce}`;
+  let recovered: string;
+  try {
+    recovered = ethers.verifyMessage(message, signature);
+  } catch {
+    res.status(401).json({ error: "Invalid signature" }); return;
+  }
+
+  if (recovered.toLowerCase() !== walletAddress.toLowerCase()) {
+    res.status(401).json({ error: "Signature does not match the claimed wallet address" }); return;
+  }
+
+  // Nonce consumed — delete before any await to prevent replay
+  walletNonces.delete(email);
+
+  await updateHospitalWalletAddress(email, walletAddress);
+
+  // Authorize the hospital's wallet on-chain via the deployer (owner) contract instance.
+  // This is an intentional, acceptable centralization point — the deployer is the admin
+  // who approves new hospital nodes, same as any permissioned network's admin role.
+  try {
+    const tx = await contract.authorizeHospital(walletAddress);
+    await tx.wait();
+  } catch (err: any) {
+    console.error("[wallet-verify] authorizeHospital failed:", err.message);
+    res.status(500).json({ error: "Failed to authorize wallet on-chain" }); return;
+  }
+
+  res.json({ success: true, walletAddress });
+});
+
+// ── POST /admin/verify-email (temporary) ─────────────────────────────────────
 app.post("/admin/verify-email", authLimiter, async (req: Request, res: Response) => {
   const { secret, email } = req.body;
   if (!email || typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -241,6 +318,30 @@ app.post("/admin/verify-email", authLimiter, async (req: Request, res: Response)
   if (!match) { res.status(403).json({ error: "Forbidden" }); return; }
   await markVerified(email);
   res.json({ message: `${email} marked as verified` });
+});
+
+// ── POST /admin/revoke-hospital ───────────────────────────────────────────────
+app.post("/admin/revoke-hospital", async (req: Request, res: Response) => {
+  const { email, adminSecret } = req.body;
+  if (!email || !adminSecret) {
+    res.status(400).json({ error: "email and adminSecret are required" }); return;
+  }
+  if (adminSecret !== process.env.ADMIN_SECRET) {
+    res.status(401).json({ error: "Invalid admin secret" }); return;
+  }
+  const walletAddress = await getHospitalWalletAddress(email);
+  if (!walletAddress) {
+    res.status(404).json({ error: "Hospital not found or has no wallet address" }); return;
+  }
+  try {
+    const tx = await contract.revokeHospital(walletAddress);
+    await tx.wait();
+  } catch (err: any) {
+    console.error("[admin/revoke-hospital] revokeHospital failed:", err.message);
+    res.status(500).json({ error: "Failed to revoke hospital on-chain" }); return;
+  }
+  await markHospitalRevoked(email);
+  res.json({ success: true, email, walletAddress });
 });
 
 // ── GET /network/status ───────────────────────────────────────────────────────
@@ -269,8 +370,8 @@ app.get("/records/all", requireAuth, async (_req: Request, res: Response) => {
   } catch (error: any) { console.error("[records/all]", error); res.status(500).json({ error: "Internal server error" }); }
 });
 
-// ── POST /add-record ──────────────────────────────────────────────────────────
-app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req: Request, res: Response) => {
+// ── POST /add-record/prepare ──────────────────────────────────────────────────
+app.post("/add-record/prepare", requireAuth, express.json({ limit: "20mb" }), async (req: Request, res: Response) => {
   try {
     const {
       patientId, fullName, dateOfBirth, patientEmail,
@@ -294,6 +395,10 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     if (!/^[A-Za-z0-9\-]+$/.test(patientId.trim())) {
       res.status(400).json({ error: "Patient ID may only contain letters, digits and hyphens" }); return;
     }
+
+    // Lazy expiry: clean up any stale pending submissions for this patient
+    // before doing anything else, so orphaned patient_emails rows are removed.
+    await expireStaleSubmissions(patientId.trim().toLowerCase());
 
     const isAmendment = typeof previousIpfsHash === "string" && previousIpfsHash.trim().length > 0;
     const prevHash    = isAmendment ? previousIpfsHash.trim() : "";
@@ -327,9 +432,9 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     if (isAmendment) {
       // Fetch and decrypt the previous version to backfill any Profile fields not supplied
       try {
-        const prevVersionCount = await contract.getRecordCount(patientId.trim().toLowerCase());
+        const prevVersionCount = await contract.getRecordCount(hashPatientId(patientId));
         const prevOnChain = await contract.getRecordVersion.staticCall(
-          patientId.trim().toLowerCase(),
+          hashPatientId(patientId),
           Number(prevVersionCount)
         );
         const prevIpfsHash = prevOnChain[0] as string;
@@ -400,6 +505,11 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
       profilePhoto:       resolvedProfilePhoto,
     };
 
+    // Check whether this patient already has a stored email row — determines
+    // whether this is a genuinely new patient (needed for submissionId tracking).
+    const existingEmail = await getPatientEmail(patientId.trim().toLowerCase());
+    const isNewPatient  = !existingEmail;
+
     // Persist patient email for future access requests
     if (resolvedPatientEmail) {
       await storePatientEmail(patientId.trim().toLowerCase(), resolvedPatientEmail);
@@ -427,45 +537,157 @@ app.post("/add-record", requireAuth, express.json({ limit: "20mb" }), async (req
     const pinResult = await pinata.upload.public.json(payload);
     const ipfsHash  = pinResult.cid;
 
-    // Store on-chain — catch stale-data race condition
-    let tx: any;
-    try {
-      tx = await contract.storeRecord(patientId.trim().toLowerCase(), ipfsHash, prevHash);
-      await tx.wait();
-    } catch (contractErr: any) {
-      const reason: string = contractErr?.reason ?? contractErr?.message ?? "";
-      if (reason.includes("previousIpfsHash does not match latest record")) {
-        res.status(409).json({
-          error: "This patient's record was updated by someone else since you opened this form — please refresh and try again",
-        });
-        return;
-      }
-      throw contractErr;
+    const hashed = hashPatientId(patientId);
+
+    // For new patients only: persist a pending_submissions row so /add-record/cancel
+    // can safely roll back the patient_emails row if the wallet tx never completes.
+    let submissionId: string | undefined;
+    if (isNewPatient) {
+      submissionId = crypto.randomBytes(16).toString("hex");
+      await createPendingSubmission(submissionId, patientId.trim().toLowerCase());
     }
 
-    // Compute encounter label (Task 4 naming) — version count after tx is the new version
-    const newVersion    = Number(await contract.getRecordCount(patientId.trim().toLowerCase()));
-    const encounterLabel = newVersion === 1 ? "Initial Record" : `Encounter ${newVersion - 1}`;
-    const pid           = patientId.trim().toLowerCase();
+    const response: Record<string, string> = {
+      ipfsHash,
+      previousIpfsHash: prevHash,
+      hashedPatientId:  hashed,
+    };
+    if (submissionId) response.submissionId = submissionId;
 
-    // Email notification to hospital
+    res.json(response);
+  } catch (error: any) {
+    console.error("[add-record/prepare]", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── Helper: verify a storeRecord tx actually landed on-chain ────────────────
+/**
+ * Independently verifies that txHash:
+ *   1. Exists and succeeded (not reverted)
+ *   2. Was sent to our CONTRACT_ADDRESS
+ *   3. Was signed by the wallet on file for expectedHospitalEmail
+ *
+ * Returns null on success, or an error string describing what failed.
+ */
+async function verifyStoreRecordTx(
+  txHash: string,
+  expectedHospitalEmail: string
+): Promise<string | null> {
+  const receipt = await provider.getTransactionReceipt(txHash);
+  if (!receipt) {
+    return "Transaction not found — it may not have confirmed yet";
+  }
+  if (receipt.status !== 1) {
+    return "Transaction was reverted on-chain";
+  }
+  const contractAddress = process.env.CONTRACT_ADDRESS!;
+  if (receipt.to?.toLowerCase() !== contractAddress.toLowerCase()) {
+    return `Transaction was not sent to the expected contract (got ${receipt.to})`;
+  }
+  const storedWallet = await getHospitalWalletAddress(expectedHospitalEmail);
+  if (!storedWallet) {
+    return "No wallet address on file for this hospital — complete wallet linking first";
+  }
+  if (receipt.from.toLowerCase() !== storedWallet.toLowerCase()) {
+    return `Transaction sender (${receipt.from}) does not match the wallet on file for this hospital`;
+  }
+  return null;
+}
+
+// ── POST /add-record/confirm ─────────────────────────────────────────────────
+app.post("/add-record/confirm", requireAuth, async (req: Request, res: Response) => {
+  const { patientId, txHash, ipfsHash, submissionId } = req.body;
+
+  if (!patientId || !txHash || !ipfsHash) {
+    res.status(400).json({ error: "patientId, txHash and ipfsHash are required" }); return;
+  }
+  if (typeof patientId !== "string" || !/^[A-Za-z0-9\-]+$/.test(patientId.trim())) {
+    res.status(400).json({ error: "Invalid patientId" }); return;
+  }
+
+  try {
+    // Lazy expiry before processing
+    await expireStaleSubmissions(patientId.trim().toLowerCase());
+
+    // Independently verify the transaction before trusting anything the client says.
     const user = res.locals.user as { email: string };
-    if (user?.email) {
-      try {
-        await sendRecordStoredNotification(user.email, pid, tx.hash, ipfsHash, resolvedFullName, encounterLabel);
-      } catch (e: any) { console.warn("[mailer]", e.message); }
+    const txError = await verifyStoreRecordTx(txHash, user.email);
+    if (txError) {
+      res.status(400).json({ error: `Transaction verification failed: ${txError}` }); return;
     }
 
-    // Email notification to patient — access is Patient-ID-based (Task 6), no hash forwarding needed
-    if (resolvedPatientEmail) {
+    // Independently verify the client-supplied ipfsHash against the chain.
+    // getIpfsHash() returns the latest stored CID — if it matches what the
+    // frontend claims, the transaction genuinely landed with that payload.
+    // This prevents a malicious or buggy client from triggering confirmation
+    // emails for a hash that was never actually stored on-chain.
+    let onChainHash: string;
+    try {
+      onChainHash = await contract.getIpfsHash(hashPatientId(patientId));
+    } catch (err: any) {
+      if (err.reason && err.reason.includes("Record not found")) {
+        res.status(404).json({ error: "Record not found on blockchain — transaction may not have confirmed yet" }); return;
+      }
+      throw err;
+    }
+
+    if (onChainHash !== ipfsHash) {
+      res.status(409).json({ error: "ipfsHash does not match the latest record on-chain" }); return;
+    }
+
+    const pid            = patientId.trim().toLowerCase();
+    const newVersion     = Number(await contract.getRecordCount(hashPatientId(patientId)));
+    const encounterLabel = newVersion === 1 ? "Initial Record" : `Encounter ${newVersion - 1}`;
+
+    // Resolve fullName and patientEmail for notification emails.
+    let fullName     = "";
+    let patientEmail = "";
+
+    if (submissionId && typeof submissionId === "string") {
+      // Mark completed in DB — this prevents cancel from rolling back the email row
+      await completePendingSubmission(submissionId);
+    }
+
+    // Patient email is already in patient_emails (written by /prepare)
+    patientEmail = (await getPatientEmail(pid)) ?? "";
+
+    // Hospital confirmation email
+    try {
+      await sendRecordStoredNotification(user.email, pid, txHash, ipfsHash, fullName, encounterLabel);
+    } catch (e: any) { console.warn("[mailer]", e.message); }
+
+    // Patient confirmation email
+    if (patientEmail) {
       try {
-        await sendRecordStoredNotification(resolvedPatientEmail, pid, tx.hash, ipfsHash, resolvedFullName, encounterLabel);
+        await sendRecordStoredNotification(patientEmail, pid, txHash, ipfsHash, fullName, encounterLabel);
       } catch (e: any) { console.warn("[mailer] patient notification failed:", e.message); }
     }
 
-    res.json({ success: true, txHash: tx.hash, ipfsHash });
+    res.json({ success: true, txHash, ipfsHash });
   } catch (error: any) {
-    console.error("[add-record]", error);
+    console.error("[add-record/confirm]", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── POST /add-record/cancel ──────────────────────────────────────────────────
+app.post("/add-record/cancel", requireAuth, async (req: Request, res: Response) => {
+  const { submissionId } = req.body;
+  if (!submissionId || typeof submissionId !== "string") {
+    res.status(400).json({ error: "submissionId is required" }); return;
+  }
+  try {
+    // cancelPendingSubmission returns the patientId only when the row was
+    // genuinely pending — meaning this submission created the patient_emails row.
+    // If already completed or cancelled, it returns null and we do nothing.
+    const patientId = await cancelPendingSubmission(submissionId);
+    if (patientId) {
+      await deletePatientEmail(patientId);
+    }
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("[add-record/cancel]", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -497,7 +719,7 @@ app.post("/access/request", requireAuth, accessLimiter, async (req: Request, res
     // Step 1: Confirm the patient record exists on-chain
     // getIpfsHash() always returns the latest version's hash — no client hash needed.
     try {
-      await contract.getIpfsHash(patientId.trim().toLowerCase());
+      await contract.getIpfsHash(hashPatientId(patientId));
     } catch (err: any) {
       if (err.reason && err.reason.includes("Record not found")) {
         res.status(404).json({ error: "Record not found on blockchain" }); return;
@@ -616,7 +838,7 @@ app.get("/access/respond", async (req: Request, res: Response) => {
       // address so getRecord (which checks patientConsent[id][msg.sender])
       // will pass for all hospitals using this backend.
       const walletAddress = await (contract.runner as any).getAddress() as string;
-      await contract.grantConsent(request.patientId, String(walletAddress));
+      await contract.grantConsent(hashPatientId(request.patientId), String(walletAddress));
 
       // Write "approved" to wait-free register — atomic, wait-free
       const register = getOrCreateRegister(request.patientId);
@@ -674,7 +896,7 @@ app.get("/access/respond", async (req: Request, res: Response) => {
  * to avoid duplicating decrypt logic.
  */
 async function fetchVersionData(patientId: string, version: number, hospitalEmail: string, privateKey: string) {
-  const onChain  = await contract.getRecordVersion.staticCall(patientId, version);
+  const onChain  = await contract.getRecordVersion.staticCall(hashPatientId(patientId), version);
   const ipfsHash = onChain[0] as string;
   const data     = await pinata.gateways.public.get(ipfsHash);
   const payload  = data.data as unknown as EncryptedPayload;
@@ -710,13 +932,13 @@ async function fetchVersionData(patientId: string, version: number, hospitalEmai
   };
 }
 
-// ── GET /get-record/:id ───────────────────────────────────────────────────────
+// ── POST /get-record/:id ──────────────────────────────────────────────────────
 /**
  * Returns the full decrypted patient record.
  * Only called AFTER the patient has approved access (status = "approved").
  * The frontend polls /access/status and only calls this endpoint when approved.
  */
-app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
+app.post("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
   const id = req.params.id;
   if (typeof id !== "string" || id.trim().length === 0 || id.length > 100) {
     res.status(400).json({ error: "Invalid or missing patient ID" }); return;
@@ -730,7 +952,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
   try {
     // Confirm record exists on-chain before fetching
     try {
-      await contract.getIpfsHash(id.toLowerCase());
+      await contract.getIpfsHash(hashPatientId(id));
     } catch (err: any) {
       if (err.reason && err.reason.includes("Record not found")) {
         res.status(404).json({ error: "Record not found on blockchain" }); return;
@@ -740,7 +962,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
 
     // Use shared fetchVersionData helper — gets the latest version
     // getRecordCount returns the current version number (latest)
-    const latestVersion = Number(await contract.getRecordCount(id.toLowerCase()));
+    const latestVersion = Number(await contract.getRecordCount(hashPatientId(id)));
     const result1       = await fetchVersionData(id.toLowerCase(), latestVersion, res.locals.user.email, rsaPrivateKey);
 
     // k-set Byzantine consensus (n=5, f=1, k=2)
@@ -773,7 +995,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// ── GET /record-history/:patientId ──────────────────────────────────────────
+// ── POST /record-history/:patientId ─────────────────────────────────────────
 /**
  * Returns all encounter versions for a patient, newest first.
  * Requires approved consent in the wait-free register (same check as get-record).
@@ -782,7 +1004,7 @@ app.get("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
  * Each entry includes the HL7 FHIR Encounter label (Task 4 naming),
  * timestamp, encounter fields, and IPFS CID for provenance.
  */
-app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Response) => {
+app.post("/record-history/:patientId", requireAuth, async (req: Request, res: Response) => {
   const pid = String(req.params.patientId).trim().toLowerCase();
   if (!pid || pid.length > 100) {
     res.status(400).json({ error: "Invalid patient ID" }); return;
@@ -801,17 +1023,18 @@ app.get("/record-history/:patientId", requireAuth, async (req: Request, res: Res
   }
 
   try {
-    const count = Number(await contract.getRecordCount(pid));
+    const count = Number(await contract.getRecordCount(hashPatientId(pid)));
     if (count === 0) { res.status(404).json({ error: "Record not found" }); return; }
 
     // Fetch all versions newest-first
     const encounters = [];
     for (let v = count; v >= 1; v--) {
       const entry = await fetchVersionData(pid, v, res.locals.user.email, rsaPrivateKey);
-      // HL7 FHIR Encounter label — v1 = "Initial Record", v2+ = "Encounter N-1"
       const label = v === 1 ? "Initial Record" : `Encounter ${v - 1}`;
+      const hospitalName = await getHospitalNameByWallet(entry.hospital) ?? entry.hospital;
       encounters.push({
         label,
+        hospitalName,
         version:            entry.version,
         timestamp:          entry.timestamp,
         ipfsHash:           entry.ipfsHash,

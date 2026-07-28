@@ -45,4 +45,5 @@ const wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
 
 const contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, wallet);
 
+export { provider };
 export default contract;

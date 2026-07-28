@@ -1,9 +1,15 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import './AuthPage.css';
 
-type AuthStep = 'login' | 'register' | 'verify-otp' | 'forgot' | 'reset-password';
+declare global {
+  interface Window {
+    ethereum?: any;
+  }
+}
 
-interface Props { onAuth: (token: string, hospitalName: string) => void; }
+type AuthStep = 'login' | 'register' | 'verify-otp' | 'forgot' | 'reset-password' | 'connect-wallet';
+
+interface Props { onAuth: (token: string, hospitalName: string, rsaKey: string) => void; }
 
 const API = import.meta.env.VITE_API_URL;
 
@@ -244,6 +250,12 @@ export default function AuthPage({ onAuth }: Props) {
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
   const [info,  setInfo]        = useState('');
+  const [pendingEmail, setPendingEmail]   = useState('');
+  const [rsaPrivateKey, setRsaPrivateKey] = useState('');
+  const [keyWarning, setKeyWarning]       = useState('');
+  const [keyCopied, setKeyCopied]         = useState(false);
+  const [keyAcknowledged, setKeyAcknowledged] = useState(false);
+  const [showKeyModal, setShowKeyModal]   = useState(false);
 
   const set = (k: string, v: string | boolean) => {
     setForm(f => ({ ...f, [k]: v }));
@@ -266,7 +278,7 @@ export default function AuthPage({ onAuth }: Props) {
     try {
       if (step === 'login') {
         const data = await post('/auth/login', { email: form.email, password: form.password });
-        onAuth(data.token, data.hospitalName);
+        onAuth(data.token, data.hospitalName, '');
 
       } else if (step === 'register') {
         if (!form.termsAccepted) {
@@ -287,9 +299,14 @@ export default function AuthPage({ onAuth }: Props) {
         setStep('verify-otp');
 
       } else if (step === 'verify-otp') {
-        await post('/auth/verify-otp', { email: form.email, code: form.code });
-        setInfo('Email verified! You can now log in.');
-        setStep('login');
+        const data = await post('/auth/verify-otp', { email: form.email, code: form.code });
+        if (data.rsaPrivateKey) {
+          setRsaPrivateKey(data.rsaPrivateKey);
+          setKeyWarning(data.keyWarning || 'Save this private key — it will never be shown again.');
+          setShowKeyModal(true);
+        }
+        setPendingEmail(form.email);
+        // Step transition happens after modal acknowledgment, not here
 
       } else if (step === 'forgot') {
         await post('/auth/forgot-password', { email: form.email });
@@ -312,7 +329,146 @@ export default function AuthPage({ onAuth }: Props) {
     }
   };
 
+  const connectWallet = async () => {
+    setLoading(true); setError(''); setInfo('');
+    try {
+      // Point 1 — check MetaMask exists
+      if (!window.ethereum) {
+        setError('MetaMask (or another Ethereum wallet browser extension) is required to continue. Install it at https://metamask.io');
+        return;
+      }
+
+      // Point 2 — request accounts
+      const accounts: string[] = await window.ethereum.request({ method: 'eth_requestAccounts' });
+      const walletAddress = accounts[0];
+      if (!walletAddress) {
+        setError('No account found. Please unlock MetaMask and try again.');
+        return;
+      }
+
+      // Point 3 — verify Sepolia network
+      const chainId: string = await window.ethereum.request({ method: 'eth_chainId' });
+      if (chainId !== '0xaa36a7') {
+        try {
+          await window.ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: '0xaa36a7' }],
+          });
+        } catch (switchErr: any) {
+          if (switchErr.code === 4001) {
+            setError('You must switch to the Sepolia test network to continue.');
+          } else {
+            setError('Failed to switch network: ' + (switchErr.message || 'Unknown error'));
+          }
+          return;
+        }
+      }
+
+      // Point 4 — get nonce message from backend
+      const token = sessionStorage.getItem('cl_token');
+      const nonceRes = await fetch(`${API}/auth/wallet-nonce`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ email: pendingEmail }),
+      });
+      const nonceData = await nonceRes.json();
+      if (!nonceRes.ok) throw new Error(nonceData.error || 'Failed to get nonce');
+      const message: string = nonceData.message;
+
+      // Point 5 — sign the message (no gas, just a signature prompt)
+      const { BrowserProvider } = await import('ethers');
+      const provider = new BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      let signature: string;
+      try {
+        signature = await signer.signMessage(message);
+      } catch (signErr: any) {
+        if (signErr.code === 4001 || signErr.code === 'ACTION_REJECTED') {
+          setError('Signature rejected. You must sign the message to link your wallet.');
+        } else {
+          setError('Signing failed: ' + (signErr.message || 'Unknown error'));
+        }
+        return;
+      }
+
+      // Point 6 — verify signature on backend
+      const verifyRes = await fetch(`${API}/auth/wallet-verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ email: pendingEmail, walletAddress, signature }),
+      });
+      const verifyData = await verifyRes.json();
+      if (!verifyRes.ok) throw new Error(verifyData.error || 'Wallet verification failed');
+
+      // Point 7 — success
+      setInfo('Wallet connected! You can now log in.');
+      setStep('login');
+    } catch (err: any) {
+      setError(err.message || 'An unexpected error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const nav = (s: AuthStep) => { setStep(s); setError(''); setInfo(''); };
+
+  /* ── RSA Key Modal ── */
+  if (showKeyModal) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 24 }}>
+        <div style={{ background: '#fff', borderRadius: 20, padding: 40, maxWidth: 560, width: '100%', boxShadow: '0 8px 40px rgba(0,0,0,0.2)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+            <span className="material-symbols-outlined" style={{ fontSize: 32, color: '#b45309' }}>warning</span>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 800, color: '#92400e' }}>Save Your RSA Private Key</h2>
+          </div>
+          <p style={{ fontSize: '0.9rem', color: '#3f4949', marginBottom: 16, lineHeight: 1.6 }}>{keyWarning}</p>
+          <div style={{ position: 'relative', marginBottom: 16 }}>
+            <textarea
+              readOnly
+              value={rsaPrivateKey}
+              rows={8}
+              style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.75rem', padding: '12px', borderRadius: 10, border: '1px solid #d1d5db', background: '#f9fafb', resize: 'none', boxSizing: 'border-box' }}
+            />
+            <button
+              type="button"
+              onClick={() => { navigator.clipboard.writeText(rsaPrivateKey); setKeyCopied(true); }}
+              style={{ position: 'absolute', top: 10, right: 10, padding: '6px 14px', borderRadius: 8, border: 'none', background: keyCopied ? '#16a34a' : '#0047d6', color: '#fff', fontSize: '0.8rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>{keyCopied ? 'check' : 'content_copy'}</span>
+              {keyCopied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginBottom: 24 }}>
+            <input
+              type="checkbox"
+              checked={keyAcknowledged}
+              onChange={e => setKeyAcknowledged(e.target.checked)}
+              style={{ marginTop: 3, flexShrink: 0 }}
+            />
+            <span style={{ fontSize: '0.875rem', color: '#3f4949' }}>
+              I have saved this private key somewhere safe. I understand it cannot be recovered if lost.
+            </span>
+          </label>
+          <button
+            type="button"
+            disabled={!keyAcknowledged}
+            onClick={() => { setShowKeyModal(false); setStep('connect-wallet'); }}
+            className="cl-btn-primary"
+            style={{ opacity: keyAcknowledged ? 1 : 0.5, cursor: keyAcknowledged ? 'pointer' : 'not-allowed' }}
+          >
+            <span>Continue to Wallet Setup</span>
+            <span className="material-symbols-outlined cl-btn-icon">arrow_forward</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (step === 'login') {
     return (
@@ -325,10 +481,11 @@ export default function AuthPage({ onAuth }: Props) {
   }
 
   const meta: Record<Exclude<AuthStep, 'login'>, { title: string; sub: string; btnLabel: string; btnIcon: string }> = {
-    register:         { title: 'Hospital Registration', sub: "Initialize your facility's encrypted node on the network.",                  btnLabel: 'Register Facility', btnIcon: 'arrow_forward' },
-    'verify-otp':     { title: 'Verify Your Email',     sub: `Enter the 6-digit code sent to ${form.email || 'your email'}.`,              btnLabel: 'Verify OTP',        btnIcon: 'verified'      },
-    forgot:           { title: 'Account Recovery',      sub: 'Enter your registered hospital email to receive a reset OTP.',               btnLabel: 'Send Reset OTP',    btnIcon: 'send'          },
-    'reset-password': { title: 'Reset Password',        sub: `Enter the OTP sent to ${form.email || 'your email'} and your new password.`, btnLabel: 'Reset Password',    btnIcon: 'lock_reset'    },
+    register:         { title: 'Hospital Registration',  sub: "Initialize your facility's encrypted node on the network.",                  btnLabel: 'Register Facility', btnIcon: 'arrow_forward'          },
+    'verify-otp':     { title: 'Verify Your Email',      sub: `Enter the 6-digit code sent to ${form.email || 'your email'}.`,              btnLabel: 'Verify OTP',        btnIcon: 'verified'               },
+    forgot:           { title: 'Account Recovery',       sub: 'Enter your registered hospital email to receive a reset OTP.',               btnLabel: 'Send Reset OTP',    btnIcon: 'send'                   },
+    'reset-password': { title: 'Reset Password',         sub: `Enter the OTP sent to ${form.email || 'your email'} and your new password.`, btnLabel: 'Reset Password',    btnIcon: 'lock_reset'             },
+    'connect-wallet': { title: 'Connect Your Wallet',    sub: "Link an Ethereum wallet to sign and verify your hospital's records on-chain.", btnLabel: 'Connect Wallet',    btnIcon: 'account_balance_wallet' },
   };
 
   const { title, sub, btnLabel, btnIcon } = meta[step as Exclude<AuthStep, 'login'>];
@@ -350,8 +507,35 @@ export default function AuthPage({ onAuth }: Props) {
             <p className="cl-step-sub">{sub}</p>
           </header>
 
-          <form onSubmit={handle} className="cl-form">
-
+          {step === 'connect-wallet' ? (
+            <div className="cl-form">
+              {!window.ethereum && (
+                <div className="cl-alert cl-alert-error">
+                  <span className="material-symbols-outlined cl-alert-icon">error</span>
+                  <span>
+                    MetaMask (or another Ethereum wallet browser extension) is required.{' '}
+                    <a href="https://metamask.io" target="_blank" rel="noreferrer" className="cl-link">Install MetaMask</a>
+                  </span>
+                </div>
+              )}
+              <button
+                type="button"
+                className="cl-btn-primary"
+                onClick={connectWallet}
+                disabled={loading}
+              >
+                {loading ? (
+                  <><span className="cl-spinner" />Connecting...</>
+                ) : (
+                  <>
+                    <span>Connect Wallet</span>
+                    <span className="material-symbols-outlined cl-btn-icon">account_balance_wallet</span>
+                  </>
+                )}
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handle} className="cl-form">
             {step === 'register' && (
               <Field icon="local_hospital" label="Hospital Name">
                 <input
@@ -457,6 +641,7 @@ export default function AuthPage({ onAuth }: Props) {
               )}
             </button>
           </form>
+          )}
 
           {error && (
             <div className="cl-alert cl-alert-error">

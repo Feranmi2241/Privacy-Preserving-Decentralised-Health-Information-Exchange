@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import PatientForm from './PatientForm';
 
 interface FullRecord {
@@ -14,6 +14,7 @@ interface FullRecord {
 
 interface EncounterEntry {
   label: string; version: string; timestamp: string; ipfsHash: string;
+  hospitalName: string;
   doctorName: string; department: string;
   symptoms: string; diagnosis: string;
   medication: string; dosage: string; instructions: string;
@@ -72,7 +73,7 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
   );
 }
 
-export default function RecordViewer({ token }: { token: string }) {
+export default function RecordViewer({ token, rsaKey, onRsaKey }: { token: string; rsaKey: string; onRsaKey: (k: string) => void }) {
   const [step, setStep]           = useState<Step>('search');
   const [patientId, setPatientId] = useState('');
   const [loading, setLoading]     = useState(false);
@@ -82,7 +83,11 @@ export default function RecordViewer({ token }: { token: string }) {
   const [history, setHistory]               = useState<EncounterEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
-  // Waiting page state
+  const [keyPrompt, setKeyPrompt]           = useState(false);
+  const [keyInput, setKeyInput]             = useState('');
+  const [pendingFetch, setPendingFetch]     = useState<((key: string) => void) | null>(null);
+
+  // Polling state
   const [accessStatus, setAccessStatus]     = useState<AccessStatus>('pending');
   const [timeRemaining, setTimeRemaining]   = useState(ACCESS_TIMEOUT_MS);
   const [maskedEmail, setMaskedEmail]       = useState('');
@@ -133,19 +138,42 @@ export default function RecordViewer({ token }: { token: string }) {
     }
   };
 
-  // Fetch the full record after approval — patientId only, backend resolves hash
-  const fetchRecord = async (pid: string) => {
+  // Returns the key to use, or null if we need to prompt first.
+  // If null, stores the callback so the modal can resume it.
+  const resolveKey = (onKey: (key: string) => void): boolean => {
+    if (rsaKey) { onKey(rsaKey); return true; }
+    setPendingFetch(() => onKey);
+    setKeyPrompt(true);
+    return false;
+  };
+
+  const submitKeyPrompt = () => {
+    const trimmed = keyInput.trim();
+    if (!trimmed) return;
+    onRsaKey(trimmed);
+    setKeyPrompt(false);
+    setKeyInput('');
+    if (pendingFetch) { pendingFetch(trimmed); setPendingFetch(null); }
+  };
+
+  const fetchRecord = async (pid: string, key?: string) => {
+    const useKey = key ?? rsaKey;
+    if (!useKey) { resolveKey(k => fetchRecord(pid, k)); return; }
     setLoading(true);
     try {
       const res = await fetch(
         `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(pid)}`,
-        { headers: { Authorization: `Bearer ${token}` } }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ rsaPrivateKey: useKey }),
+        }
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to retrieve record');
       setRecord(data);
       setStep('result');
-      fetchHistory(pid);
+      fetchHistory(pid, useKey);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -154,12 +182,18 @@ export default function RecordViewer({ token }: { token: string }) {
   };
 
   // Fetch full encounter history after access is approved
-  const fetchHistory = async (pid: string) => {
+  const fetchHistory = async (pid: string, key?: string) => {
+    const useKey = key ?? rsaKey;
+    if (!useKey) return;
     setHistoryLoading(true);
     try {
       const res = await fetch(
         `${import.meta.env.VITE_API_URL}/record-history/${encodeURIComponent(pid)}`,
-        { headers: { Authorization: `Bearer ${token}` } }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ rsaPrivateKey: useKey }),
+        }
       );
       const data = await res.json();
       if (res.ok) setHistory(data.encounters || []);
@@ -229,6 +263,33 @@ export default function RecordViewer({ token }: { token: string }) {
 
   return (
     <div className="fade-in">
+
+      {/* ── RSA key prompt modal ── */}
+      {keyPrompt && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 2000, padding: 24,
+        }}>
+          <div className="card" style={{ maxWidth: 520, width: '100%' }}>
+            <div className="card-title"><span>🔑</span> RSA Private Key Required</div>
+            <p style={{ fontSize: '0.875rem', color: 'var(--muted)', marginBottom: 16, lineHeight: 1.6 }}>
+              Your RSA private key is needed to decrypt this record. Paste it below — it stays in memory only and is never stored.
+            </p>
+            <textarea
+              value={keyInput}
+              onChange={e => setKeyInput(e.target.value)}
+              placeholder="-----BEGIN PRIVATE KEY-----"
+              rows={6}
+              style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.75rem', resize: 'vertical', marginBottom: 12 }}
+            />
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button className="btn btn-primary" onClick={submitKeyPrompt} style={{ width: 'auto', padding: '10px 20px' }}>Unlock</button>
+              <button className="btn btn-secondary" onClick={() => { setKeyPrompt(false); setPendingFetch(null); }} style={{ width: 'auto', padding: '10px 20px' }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Step 1: Search ── */}
       {step === 'search' && (
@@ -563,7 +624,7 @@ export default function RecordViewer({ token }: { token: string }) {
                       </span>
                     </div>
 
-                    {/* Doctor + department */}
+                    {/* Doctor + department + hospital */}
                     <div style={{ display: 'flex', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
                       <span style={{ fontSize: '0.8rem', color: 'var(--text)', fontWeight: 600 }}>
                         👨‍⚕️ {enc.doctorName}
@@ -571,6 +632,11 @@ export default function RecordViewer({ token }: { token: string }) {
                       {enc.department && (
                         <span style={{ fontSize: '0.78rem', color: 'var(--muted)' }}>
                           · {enc.department}
+                        </span>
+                      )}
+                      {enc.hospitalName && (
+                        <span style={{ fontSize: '0.78rem', color: 'var(--muted)', marginLeft: 'auto' }}>
+                          {enc.hospitalName}
                         </span>
                       )}
                     </div>

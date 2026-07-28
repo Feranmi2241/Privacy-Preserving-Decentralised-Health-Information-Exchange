@@ -48,3 +48,50 @@ not have an `rsa_public_key` row in the database. When `/add-record` builds the
 named warning. Affected hospitals need to go through a one-time keypair
 regeneration step (not yet built — out of scope for Phase 1, since all test
 accounts can simply be re-registered in a development environment).
+
+---
+
+## Phase 2 — Per-Hospital Wallet Identity (on-chain attribution upgrade)
+
+### What changed
+Before this phase, every `storeRecord` transaction was sent by the single shared
+backend deployer wallet — the same wallet used for admin operations like
+`authorizeHospital` and `grantConsent`. As a result, every `RecordAdded` event
+emitted before this phase has the deployer's address in the `hospital` field,
+regardless of which hospital account actually submitted the record through the
+dashboard.
+
+After this phase, each hospital links their own MetaMask wallet to their account
+via a SIWE (Sign-In With Ethereum) flow. The `storeRecord` transaction is now
+signed and broadcast directly by the hospital's own wallet from the browser.
+`RecordAdded` events from this point forward carry that hospital's real wallet
+address in the `hospital` field, and `getAllPatientIds()` returns only the
+patient IDs submitted by the calling wallet — enforcing per-hospital scoping at
+the contract level.
+
+### The migration boundary
+Any `RecordAdded` event with a timestamp **before this phase was deployed** will
+show the deployer wallet address as the `hospital` field, not the address of the
+hospital that actually created the record. This is not a data integrity problem —
+the IPFS payload and the patient record contents are unaffected — but it means
+on-chain provenance for pre-Phase-2 records does not identify the specific
+hospital node that submitted them.
+
+This is a known, intentional limitation. For a research deployment where all
+pre-Phase-2 records are test data, this is an acceptable boundary. The decision
+is documented here so the address discrepancy in older events is an explained
+historical artifact rather than an unexplained inconsistency.
+
+### What this means in practice
+- The encounter history timeline in the dashboard resolves the `hospital` wallet
+  address to a human-readable hospital name via a reverse lookup against the
+  `wallet_address` column. Pre-Phase-2 records will show the deployer wallet
+  address raw (no matching name row exists for it), or fall back to the address
+  string if the lookup returns null.
+- `getAllPatientIds()` scoping is only meaningful from this phase forward. Any
+  patient IDs stored under the deployer wallet before this phase are visible only
+  to the deployer, not to individual hospital wallets — they are effectively
+  unowned by any specific hospital in the new model.
+- No re-submission of old records is required for the system to function. The
+  boundary only affects on-chain attribution and per-hospital enumeration for
+  pre-Phase-2 data.

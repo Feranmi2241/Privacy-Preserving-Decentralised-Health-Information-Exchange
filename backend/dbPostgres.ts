@@ -17,6 +17,7 @@ export interface Hospital {
   passwordHash: string;
   passwordHistory: string[];
   verified: boolean;
+  revoked: boolean;
 }
 
 export interface AccessRequest {
@@ -66,7 +67,9 @@ export async function initializeDatabase(): Promise<void> {
         password_history TEXT[] DEFAULT '{}',
         verified BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW(),
-        rsa_public_key TEXT
+        rsa_public_key TEXT,
+        wallet_address VARCHAR(42),
+        revoked BOOLEAN DEFAULT FALSE
       )
     `);
 
@@ -84,6 +87,15 @@ export async function initializeDatabase(): Promise<void> {
         code VARCHAR(10) NOT NULL,
         expires_at BIGINT NOT NULL,
         purpose VARCHAR(10) NOT NULL
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pending_submissions (
+        submission_id VARCHAR(64) PRIMARY KEY,
+        patient_id    VARCHAR(100) NOT NULL,
+        created_at    TIMESTAMP DEFAULT NOW(),
+        status        VARCHAR(10) NOT NULL DEFAULT 'pending'
       )
     `);
 
@@ -175,7 +187,7 @@ export async function findHospital(email: string): Promise<Hospital | undefined>
   const client = await pool.connect();
   try {
     const result = await client.query(
-      "SELECT name, email, password_hash, password_history, verified FROM hospitals WHERE email = $1",
+      "SELECT name, email, password_hash, password_history, verified, revoked FROM hospitals WHERE email = $1",
       [email.toLowerCase()]
     );
     if (result.rows.length === 0) return undefined;
@@ -186,6 +198,7 @@ export async function findHospital(email: string): Promise<Hospital | undefined>
       passwordHash: row.password_hash,
       passwordHistory: row.password_history || [],
       verified: row.verified,
+      revoked: row.revoked ?? false,
     };
   } finally {
     client.release();
@@ -261,6 +274,56 @@ export async function getHospitalPublicKey(email: string): Promise<string | null
   }
 }
 
+export async function updateHospitalWalletAddress(email: string, walletAddress: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE hospitals SET wallet_address = $1 WHERE email = $2",
+      [walletAddress, email.toLowerCase()]
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function getHospitalWalletAddress(email: string): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT wallet_address FROM hospitals WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    return result.rows.length > 0 ? (result.rows[0].wallet_address ?? null) : null;
+  } finally {
+    client.release();
+  }
+}
+
+export async function getHospitalNameByWallet(walletAddress: string): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT name FROM hospitals WHERE LOWER(wallet_address) = LOWER($1)",
+      [walletAddress]
+    );
+    return result.rows.length > 0 ? result.rows[0].name : null;
+  } finally {
+    client.release();
+  }
+}
+
+export async function markHospitalRevoked(email: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE hospitals SET revoked = TRUE WHERE email = $1",
+      [email.toLowerCase()]
+    );
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Returns the decrypted hospital emails of every hospital with an approved
  * access_request row for this patient. Used by /add-record to build the
@@ -309,6 +372,69 @@ export async function getPatientEmail(patientId: string): Promise<string | undef
   } finally {
     client.release();
   }
+}
+
+export async function deletePatientEmail(patientId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("DELETE FROM patient_emails WHERE patient_id = $1", [patientId.toLowerCase()]);
+  } finally {
+    client.release();
+  }
+}
+
+// ── Pending submission helpers ────────────────────────────────────────────────
+export async function createPendingSubmission(submissionId: string, patientId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "INSERT INTO pending_submissions (submission_id, patient_id, status) VALUES ($1, $2, 'pending')",
+      [submissionId, patientId.toLowerCase()]
+    );
+  } finally { client.release(); }
+}
+
+export async function completePendingSubmission(submissionId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "UPDATE pending_submissions SET status = 'completed' WHERE submission_id = $1",
+      [submissionId]
+    );
+  } finally { client.release(); }
+}
+
+// Returns the patientId if the row was pending and is now cancelled; null otherwise.
+export async function cancelPendingSubmission(submissionId: string): Promise<string | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE pending_submissions SET status = 'cancelled'
+       WHERE submission_id = $1 AND status = 'pending'
+       RETURNING patient_id`,
+      [submissionId]
+    );
+    return result.rows.length > 0 ? result.rows[0].patient_id : null;
+  } finally { client.release(); }
+}
+
+// Lazy expiry: cancel any pending rows for this patient older than 3 minutes
+// and delete their patient_emails rows. Called at the top of all three
+// /add-record/* routes so stale entries are cleaned up without a background job.
+export async function expireStaleSubmissions(patientId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE pending_submissions SET status = 'cancelled'
+       WHERE patient_id = $1 AND status = 'pending'
+         AND created_at < NOW() - INTERVAL '3 minutes'
+       RETURNING submission_id`,
+      [patientId.toLowerCase()]
+    );
+    if (result.rows.length > 0) {
+      await client.query("DELETE FROM patient_emails WHERE patient_id = $1", [patientId.toLowerCase()]);
+    }
+  } finally { client.release(); }
 }
 
 // ── OTP helpers ───────────────────────────────────────────────────────────────

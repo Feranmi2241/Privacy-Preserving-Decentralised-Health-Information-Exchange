@@ -1,4 +1,10 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { ethers } from 'ethers';
+import MedicalRecordABI from '../../shared/MedicalRecordABI.json';
+
+declare global { interface Window { ethereum?: any; } }
+
+const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS as string;
 
 interface FormState {
   patientId: string; fullName: string; dateOfBirth: string; patientEmail: string;
@@ -100,6 +106,57 @@ export default function PatientForm({ token, onRecordAdded, encounterContext }: 
   const [allergiesMode, setAllergiesMode]   = useState<'unchanged' | 'update'>(isEncounter ? 'unchanged' : 'update');
   const [conditionsMode, setConditionsMode] = useState<'unchanged' | 'update'>(isEncounter ? 'unchanged' : 'update');
 
+  // walletCountdown: null = not active, number = seconds remaining, 0 = expired
+  const [walletCountdown, setWalletCountdown] = useState<number | null>(null);
+  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Tick the countdown every second while active
+  useEffect(() => {
+    if (walletCountdown === null) return;
+    if (walletCountdown <= 0) {
+      if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null; }
+      return;
+    }
+    countdownIntervalRef.current = setInterval(() => {
+      setWalletCountdown(s => (s !== null && s > 0 ? s - 1 : 0));
+    }, 1000);
+    return () => { if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null; } };
+  }, [walletCountdown === null ? null : walletCountdown > 0 ? 'active' : 'done']);
+
+  const fmtCountdown = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+  // Refs for cleanup coordination — not state because they must not trigger re-renders
+  const pendingSubmissionIdRef = useRef<string | null>(null);
+  const cancelTimeoutRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelSubmission = (submissionId: string) => {
+    fetch(`${import.meta.env.VITE_API_URL}/add-record/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ submissionId }),
+    }).catch(() => {/* best-effort */});
+  };
+
+  const clearPendingCleanup = (submissionId: string | null) => {
+    if (cancelTimeoutRef.current) { clearTimeout(cancelTimeoutRef.current); cancelTimeoutRef.current = null; }
+    if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null; }
+    window.removeEventListener('beforeunload', handleBeforeUnload);
+    pendingSubmissionIdRef.current = null;
+    setWalletCountdown(null);
+    void submissionId; // consumed by caller
+  };
+
+  // beforeunload handler — uses sendBeacon so the request survives tab close
+  const handleBeforeUnload = () => {
+    const sid = pendingSubmissionIdRef.current;
+    if (!sid) return;
+    const data = JSON.stringify({ submissionId: sid });
+    navigator.sendBeacon(
+      `${import.meta.env.VITE_API_URL}/add-record/cancel`,
+      new Blob([data], { type: 'application/json' })
+    );
+  };
+
   const set = (k: keyof FormState, v: string) => {
     setForm(f => ({ ...f, [k]: v }));
     setResult(null); setError('');
@@ -141,14 +198,82 @@ export default function PatientForm({ token, onRecordAdded, encounterContext }: 
         body.allergiesUnchanged  = allergiesMode  === 'unchanged';
         body.conditionsUnchanged = conditionsMode === 'unchanged';
       }
-      const res = await fetch(`${import.meta.env.VITE_API_URL}/add-record`, {
+
+      // Step 1 — encrypt + pin to IPFS, get back args for storeRecord
+      const prepRes = await fetch(`${import.meta.env.VITE_API_URL}/add-record/prepare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Request failed');
-      setResult({ ...data, hadPhoto });
+      const prepData = await prepRes.json();
+      if (!prepRes.ok) throw new Error(prepData.error || 'Prepare failed');
+
+      const { ipfsHash, previousIpfsHash, hashedPatientId, submissionId } = prepData as {
+        ipfsHash: string; previousIpfsHash: string;
+        hashedPatientId: string; submissionId?: string;
+      };
+
+      // Register cleanup hooks as soon as we have a submissionId —
+      // from this point until confirm/cancel, the patient_emails row exists
+      // and must be rolled back if the wallet tx never completes.
+      if (submissionId) {
+        pendingSubmissionIdRef.current = submissionId;
+        window.addEventListener('beforeunload', handleBeforeUnload);
+        setWalletCountdown(180); // start visible countdown
+
+        // 3-minute client-side timeout — fires if the hospital never responds
+        // to the MetaMask prompt. Server-side lazy expiry is the safety net
+        // for crashes; this handles the "still on the page" case.
+        cancelTimeoutRef.current = setTimeout(() => {
+          cancelSubmission(submissionId);
+          clearPendingCleanup(null);
+          setWalletCountdown(0);
+          setLoading(false);
+        }, 3 * 60 * 1000);
+      }
+
+      // Step 2 — hospital's own wallet signs and submits storeRecord on-chain
+      if (!window.ethereum) throw new Error('MetaMask is not installed.');
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer   = await provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, MedicalRecordABI, signer);
+
+      let txHash: string;
+      try {
+        const tx      = await contract.storeRecord(hashedPatientId, ipfsHash, previousIpfsHash);
+        const receipt = await tx.wait();
+        txHash = receipt.hash;
+      } catch (contractErr: any) {
+        // Explicit MetaMask rejection — cancel immediately, show expired banner
+        if (contractErr?.code === 'ACTION_REJECTED' && submissionId) {
+          cancelSubmission(submissionId);
+        }
+        clearPendingCleanup(submissionId ?? null);
+        if (contractErr?.code === 'ACTION_REJECTED') {
+          setWalletCountdown(0);
+          setLoading(false);
+          return;
+        }
+        const reason: string = contractErr?.reason ?? contractErr?.message ?? '';
+        if (reason.includes('previousIpfsHash does not match latest record')) {
+          throw new Error(
+            "This patient's record was updated by someone else since you opened this form — please refresh and try again."
+          );
+        }
+        throw contractErr;
+      }
+
+      // Step 3 — notify backend: verify on-chain + send confirmation emails
+      clearPendingCleanup(submissionId ?? null);
+      const confirmRes = await fetch(`${import.meta.env.VITE_API_URL}/add-record/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ patientId: body.patientId ?? form.patientId, txHash, ipfsHash, submissionId }),
+      });
+      const confirmData = await confirmRes.json();
+      if (!confirmRes.ok) throw new Error(confirmData.error || 'Confirm failed');
+
+      setResult({ txHash, ipfsHash, hadPhoto });
       setForm({ ...EMPTY, patientId: encounterContext?.patientId ?? '' });
       setAllergiesMode(isEncounter ? 'unchanged' : 'update');
       setConditionsMode(isEncounter ? 'unchanged' : 'update');
@@ -428,6 +553,49 @@ export default function PatientForm({ token, onRecordAdded, encounterContext }: 
               : <><span>{isEncounter ? '🔄' : '⛓️'}</span> {isEncounter ? 'Store Encounter on Blockchain' : 'Store on Blockchain'}</>}
           </button>
         </form>
+
+        {walletCountdown !== null && walletCountdown > 0 && (
+          <div style={{
+            marginTop: 20, padding: '20px 20px 18px',
+            background: 'rgba(234,179,8,0.08)',
+            border: '1.5px solid rgba(234,179,8,0.35)',
+            borderRadius: 14,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+              <span style={{ fontSize: '1.3rem' }}>⏳</span>
+              <strong style={{ fontSize: '0.95rem', color: '#92400e' }}>Confirm in Your Wallet to Complete Registration</strong>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: '#78350f', lineHeight: 1.6, marginBottom: 10 }}>
+              Your patient record has been prepared and is ready to be permanently saved to the blockchain.
+              Please confirm the transaction in your connected wallet within{' '}
+              <strong style={{ fontFamily: 'monospace', fontSize: '1rem', color: '#b45309' }}>{fmtCountdown(walletCountdown)}</strong>.
+            </p>
+            <p style={{ fontSize: '0.8rem', color: '#92400e', lineHeight: 1.55, marginBottom: 8 }}>
+              If you reject the transaction or close this tab, the record will not be saved, and you will need to start the registration process again.
+            </p>
+            <p style={{ fontSize: '0.8rem', color: '#92400e', lineHeight: 1.55 }}>
+              If no confirmation is received before the time above reaches zero — including if this is due to a network interruption — this record will be automatically and permanently deleted, and you will need to start again.
+            </p>
+          </div>
+        )}
+
+        {walletCountdown === 0 && (
+          <div style={{
+            marginTop: 20, padding: '20px 20px 18px',
+            background: 'rgba(186,26,26,0.07)',
+            border: '1.5px solid rgba(186,26,26,0.25)',
+            borderRadius: 14,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+              <span style={{ fontSize: '1.3rem' }}>❌</span>
+              <strong style={{ fontSize: '0.95rem', color: '#93000a' }}>Registration Not Completed</strong>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: '#93000a', lineHeight: 1.6 }}>
+              This patient record was not confirmed in time and has been permanently deleted.
+              Please start the registration process again.
+            </p>
+          </div>
+        )}
 
         {result && (
           <div className="alert alert-success" style={{ marginTop: 20 }}>

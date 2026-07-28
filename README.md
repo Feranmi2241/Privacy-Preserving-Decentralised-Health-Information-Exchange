@@ -93,6 +93,36 @@ cd frontend && npm run dev
 
 ---
 
+## Browser Wallet Setup (Required to Run the Dashboard)
+
+Adding a patient record requires a MetaMask (or any EIP-1193 compatible) browser wallet. The hospital's own wallet signs the `storeRecord` transaction on-chain — without it, the "Add Record" flow will fail at the MetaMask step with no funds and no explanation.
+
+### 1. Install MetaMask
+
+Download from [metamask.io](https://metamask.io/download/) and create or import a wallet.
+
+### 2. Add the Sepolia test network
+
+MetaMask includes Sepolia by default. Click the network dropdown at the top of the extension and select **Sepolia**. If it is not listed, enable test networks under **Settings → Advanced → Show test networks**.
+
+### 3. Get free Sepolia test ETH
+
+You need a small amount of Sepolia ETH to pay gas for `storeRecord` transactions. Use any of these faucets — each requires a brief wait or a Google/GitHub login:
+
+- **Alchemy Sepolia Faucet** — [sepoliafaucet.com](https://sepoliafaucet.com) (0.5 ETH/day, requires Alchemy account)
+- **Google Cloud Faucet** — [cloud.google.com/application/web3/faucet/ethereum/sepolia](https://cloud.google.com/application/web3/faucet/ethereum/sepolia) (0.05 ETH, no account needed)
+- **Chainlink Faucet** — [faucets.chain.link](https://faucets.chain.link/sepolia) (0.1 ETH/day)
+
+One faucet request gives enough ETH for hundreds of test transactions.
+
+### 4. Connect the wallet in the dashboard
+
+After logging in, the dashboard will prompt you to link your MetaMask wallet. This signs a one-time message (no gas cost) to associate your wallet address with your hospital account. Every subsequent `storeRecord` call will then prompt MetaMask for a normal transaction signature.
+
+> **Local / Ganache development:** if you are running against a local Ganache network instead of Sepolia, switch MetaMask to the matching custom RPC (`http://127.0.0.1:7545`, chain ID `1337`) and import one of the Ganache-generated private keys — those accounts are pre-funded with test ETH.
+
+---
+
 ## How the Patient Authorization Flow Works
 
 This system implements an **email-based, asynchronous access control model** — patients control access to their records via email without needing a separate portal.

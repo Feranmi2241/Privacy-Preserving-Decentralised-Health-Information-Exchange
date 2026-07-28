@@ -208,6 +208,11 @@ describe("MedicalRecord", function () {
 
       expect(h1Addr).to.equal(hospital1.address);
       expect(h2Addr).to.equal(hospital2.address);
+
+      const h1Ids = await contract.connect(hospital1).getAllPatientIds();
+      const h2Ids = await contract.connect(hospital2).getAllPatientIds();
+      expect(h1Ids).to.not.include("PAT-H2");
+      expect(h2Ids).to.not.include("PAT-H1");
     });
   });
 
