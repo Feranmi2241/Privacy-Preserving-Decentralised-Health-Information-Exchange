@@ -192,25 +192,33 @@ export default function App() {
   // Persist token in sessionStorage so page refresh doesn't force re-login
   const [token, setToken]               = useState(() => sessionStorage.getItem('cl_token') || '');
   const [hospitalName, setHospitalName] = useState(() => sessionStorage.getItem('cl_hospital') || '');
+  const [hospitalEmail, setHospitalEmail] = useState(() => sessionStorage.getItem('cl_email') || '');
+  // rsaKey is intentionally kept in plain React state only — never written to
+  // localStorage or sessionStorage. handleSignOut clears it alongside the token,
+  // so it is always wiped on logout. Do not add any persistence for this value.
   const [rsaKey, setRsaKey]             = useState('');
   const [tab, setTab]                   = useState<Tab>('add');
   const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [network, setNetwork]           = useState<NetworkStatus | null>(null);
   const [recentIds, setRecentIds]       = useState<string[]>([]);
 
-  const handleAuth = (t: string, h: string, rsa: string) => {
+  const handleAuth = (t: string, h: string, rsa: string, e: string) => {
     sessionStorage.setItem('cl_token', t);
     sessionStorage.setItem('cl_hospital', h);
+    sessionStorage.setItem('cl_email', e);
     setToken(t);
     setHospitalName(h);
+    setHospitalEmail(e);
     if (rsa) setRsaKey(rsa);
   };
 
   const handleSignOut = () => {
     sessionStorage.removeItem('cl_token');
     sessionStorage.removeItem('cl_hospital');
+    sessionStorage.removeItem('cl_email');
     setToken('');
     setHospitalName('');
+    setHospitalEmail('');
     setRsaKey('');
   };
 
@@ -324,8 +332,8 @@ export default function App() {
             <div className="ds-bento-main">
               <div className="ds-bento-main-blob" />
               <div className="ds-tab-content">
-                {tab === 'add'  && <PatientForm token={token} rsaKey={rsaKey} onRsaKey={setRsaKey} onRecordAdded={fetchRecentIds} />}
-                {tab === 'view' && <RecordViewer token={token} rsaKey={rsaKey} onRsaKey={setRsaKey} />}
+                {tab === 'add'  && <PatientForm token={token} rsaKey={rsaKey} email={hospitalEmail} onRecordAdded={fetchRecentIds} />}
+                {tab === 'view' && <RecordViewer token={token} rsaKey={rsaKey} onRsaKey={setRsaKey} email={hospitalEmail} />}
                 {tab === 'all'  && <AllPatients token={token} />}
               </div>
             </div>

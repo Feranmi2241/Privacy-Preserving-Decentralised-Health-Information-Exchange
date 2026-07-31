@@ -65,11 +65,12 @@ import {
   deletePatientEmail,
   createPendingSubmission, completePendingSubmission,
   cancelPendingSubmission, expireStaleSubmissions,
-  getHospitalNameByWallet,
+  createRevokeToken, consumeRevokeToken,
 } from "./dbPostgres";
 import {
   sendSignupOTP, sendForgotOTP, sendRecordStoredNotification,
   sendPatientAuthorizationRequest,
+  sendPatientAccessConfirmation,
   sendAccessGrantedNotification, sendAccessDeniedNotification,
 } from "./mailer";
 import { signToken, verifyToken, STRONG_PASSWORD_REGEX } from "./auth";
@@ -381,12 +382,7 @@ app.post("/add-record/prepare", requireAuth, express.json({ limit: "20mb" }), as
       medication, dosage, instructions,
       doctorName, department,
       profilePhoto, previousIpfsHash,
-      allergiesUnchanged, conditionsUnchanged,
-      rsaPrivateKey,
     } = req.body;
-
-    const keepAllergies   = allergiesUnchanged   === true || allergiesUnchanged   === "true";
-    const keepConditions  = conditionsUnchanged  === true || conditionsUnchanged  === "true";
 
     // Patient ID is always required
     if (typeof patientId !== "string" || patientId.trim().length === 0) {
@@ -403,11 +399,6 @@ app.post("/add-record/prepare", requireAuth, express.json({ limit: "20mb" }), as
     const isAmendment = typeof previousIpfsHash === "string" && previousIpfsHash.trim().length > 0;
     const prevHash    = isAmendment ? previousIpfsHash.trim() : "";
 
-    // Private key required for amendments — needed to decrypt previous version for profile backfill
-    if (isAmendment && (!rsaPrivateKey || typeof rsaPrivateKey !== "string")) {
-      res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
-    }
-
     // Encounter fields are required on every submission (first record AND amendment)
     const encounterFields: Record<string, string> = {
       symptoms, diagnosis, medication, dosage, instructions, doctorName, department,
@@ -418,7 +409,7 @@ app.post("/add-record/prepare", requireAuth, express.json({ limit: "20mb" }), as
       }
     }
 
-    // ── Profile fields: required on first record, backfilled from previous version on amendment ──
+    // ── Profile fields: required on first record, must be supplied by frontend on amendment ──
     let resolvedFullName      = typeof fullName      === "string" ? fullName.trim()      : "";
     let resolvedDateOfBirth   = typeof dateOfBirth   === "string" ? dateOfBirth.trim()   : "";
     let resolvedPatientEmail  = typeof patientEmail  === "string" ? patientEmail.trim().toLowerCase()  : "";
@@ -430,31 +421,15 @@ app.post("/add-record/prepare", requireAuth, express.json({ limit: "20mb" }), as
     let resolvedConditions    = typeof existingConditions === "string" ? existingConditions.trim() : "";
 
     if (isAmendment) {
-      // Fetch and decrypt the previous version to backfill any Profile fields not supplied
-      try {
-        const prevVersionCount = await contract.getRecordCount(hashPatientId(patientId));
-        const prevOnChain = await contract.getRecordVersion.staticCall(
-          hashPatientId(patientId),
-          Number(prevVersionCount)
-        );
-        const prevIpfsHash = prevOnChain[0] as string;
-        const prevData     = await pinata.gateways.public.get(prevIpfsHash);
-        const prevPayload  = prevData.data as unknown as EncryptedPayload;
-        const prevParsed   = JSON.parse(decryptRecord(prevPayload, rsaPrivateKey, res.locals.user.email));
-
-        if (!resolvedFullName)     resolvedFullName     = prevParsed.fullName     || "";
-        if (!resolvedDateOfBirth)  resolvedDateOfBirth  = prevParsed.dateOfBirth  || "";
-        if (!resolvedPatientEmail) resolvedPatientEmail = prevParsed.patientEmail || "";
-        if (!resolvedPhone)        resolvedPhone        = prevParsed.phone        || "";
-        if (!resolvedAddress)      resolvedAddress      = prevParsed.address      || "";
-        if (!resolvedBloodGroup)   resolvedBloodGroup   = prevParsed.bloodGroup   || "";
-        if (!resolvedProfilePhoto) resolvedProfilePhoto = prevParsed.profilePhoto || "";
-
-        // Carry forward allergies / conditions when the frontend signals "unchanged"
-        if (keepAllergies)  resolvedAllergies   = prevParsed.allergies          || "";
-        if (keepConditions) resolvedConditions  = prevParsed.existingConditions || "";
-      } catch (fetchErr: any) {
-        console.warn("[add-record] Could not backfill profile from previous version:", fetchErr.message);
+      // Profile fields must be pre-resolved by the frontend (fetched + decrypted browser-side).
+      // The backend no longer decrypts the previous version — private key never leaves the client.
+      const profileFields: Record<string, string> = {
+        fullName: resolvedFullName, dateOfBirth: resolvedDateOfBirth,
+        patientEmail: resolvedPatientEmail, phone: resolvedPhone,
+        address: resolvedAddress, bloodGroup: resolvedBloodGroup,
+      };
+      for (const [key, val] of Object.entries(profileFields)) {
+        if (!val) { res.status(400).json({ error: `Missing resolved profile field for amendment: ${key}` }); return; }
       }
     } else {
       // First record — all Profile fields are required
@@ -832,13 +807,17 @@ app.get("/access/respond", async (req: Request, res: Response) => {
 
   try {
     if (action === "approved") {
-      // Grant consent on-chain.
-      // In this single-node deployment, all hospital operations are signed
-      // by the same deployer wallet. grantConsent is called with that wallet
-      // address so getRecord (which checks patientConsent[id][msg.sender])
-      // will pass for all hospitals using this backend.
-      const walletAddress = await (contract.runner as any).getAddress() as string;
-      await contract.grantConsent(hashPatientId(request.patientId), String(walletAddress));
+      // Grant consent on-chain for the specific hospital wallet that requested access.
+      // grantConsent is called by the deployer (owner) on behalf of the requesting hospital,
+      // authorising that hospital's wallet address in the contract's patientConsent mapping.
+      const hospitalAddress = await getHospitalWalletAddress(request.hospitalEmail);
+      if (!hospitalAddress) {
+        res.status(500).send(responseHtml("⚠️ Unable to Complete Approval",
+          "The requesting hospital's account is not fully set up yet. Please contact the hospital directly.",
+          "#f59e0b"));
+        return;
+      }
+      await contract.grantConsent(hashPatientId(request.patientId), hospitalAddress);
 
       // Write "approved" to wait-free register — atomic, wait-free
       const register = getOrCreateRegister(request.patientId);
@@ -852,6 +831,18 @@ app.get("/access/respond", async (req: Request, res: Response) => {
           request.patientId
         );
       } catch (e: any) { console.warn("[mailer]", e.message); }
+
+      // Notify patient with a single-use revoke link
+      try {
+        const revokeToken = await createRevokeToken(request.patientId, request.hospitalEmail);
+        const revokeLink  = `${process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`}/access/revoke-respond?token=${revokeToken}`;
+        await sendPatientAccessConfirmation(
+          request.patientEmail,
+          request.patientId,
+          request.hospitalName,
+          revokeLink
+        );
+      } catch (e: any) { console.warn("[mailer] sendPatientAccessConfirmation failed:", e.message); }
 
       res.send(responseHtml("✅ Access Approved",
         `You have approved access for <strong>${escapeHtml(request.hospitalName)}</strong> ` +
@@ -889,174 +880,52 @@ app.get("/access/respond", async (req: Request, res: Response) => {
   }
 });
 
-// ── Shared helper: fetch + decrypt a specific version from IPFS ──────────────
+// ── GET /access/revoke-respond ──────────────────────────────────────────────────────
 /**
- * Fetches and decrypts a single versioned record from IPFS.
- * Shared by GET /get-record/:id and GET /record-history/:patientId
- * to avoid duplicating decrypt logic.
+ * Patient clicks the revoke link from their access-confirmation email.
+ * Validates and consumes the single-use token, resolves the hospital wallet,
+ * calls revokeConsent on-chain, and returns a confirmation HTML page.
  */
-async function fetchVersionData(patientId: string, version: number, hospitalEmail: string, privateKey: string) {
-  const onChain  = await contract.getRecordVersion.staticCall(hashPatientId(patientId), version);
-  const ipfsHash = onChain[0] as string;
-  const data     = await pinata.gateways.public.get(ipfsHash);
-  const payload  = data.data as unknown as EncryptedPayload;
-  let parsed: any;
-  try {
-    parsed = JSON.parse(decryptRecord(payload, privateKey, hospitalEmail));
-  } catch (err: any) {
-    if (err.message === "NO_KEY_FOR_HOSPITAL") throw err; // propagate — caller handles as 403
-    throw err; // any other decrypt failure (bad key, tampered data) also propagates
-  }
-  return {
-    patientId,
-    fullName:           parsed.fullName           || "",
-    dateOfBirth:        parsed.dateOfBirth        || "",
-    patientEmail:       parsed.patientEmail       || "",
-    phone:              parsed.phone              || "",
-    address:            parsed.address            || "",
-    allergies:          parsed.allergies          || "",
-    existingConditions: parsed.existingConditions || "",
-    bloodGroup:         parsed.bloodGroup         || "",
-    symptoms:           parsed.symptoms           || "",
-    diagnosis:          parsed.diagnosis          || "",
-    medication:         parsed.medication         || "",
-    dosage:             parsed.dosage             || "",
-    instructions:       parsed.instructions       || "",
-    doctorName:         parsed.doctorName         || "",
-    department:         parsed.department         || "",
-    profilePhoto:       parsed.profilePhoto       || "",
-    hospital:           onChain[2] as string,
-    timestamp:          (onChain[3] as bigint).toString(),
-    version:            version.toString(),
-    ipfsHash,
-  };
-}
+app.get("/access/revoke-respond", async (req: Request, res: Response) => {
+  const { token } = req.query as { token?: string };
 
-// ── POST /get-record/:id ──────────────────────────────────────────────────────
-/**
- * Returns the full decrypted patient record.
- * Only called AFTER the patient has approved access (status = "approved").
- * The frontend polls /access/status and only calls this endpoint when approved.
- */
-app.post("/get-record/:id", requireAuth, async (req: Request, res: Response) => {
-  const id = req.params.id;
-  if (typeof id !== "string" || id.trim().length === 0 || id.length > 100) {
-    res.status(400).json({ error: "Invalid or missing patient ID" }); return;
+  if (!token) {
+    res.status(400).send(responseHtml("❌ Invalid Request",
+      "This revoke link is invalid or malformed.",
+      "#ba1a1a"));
+    return;
   }
 
-  const { rsaPrivateKey } = req.body;
-  if (!rsaPrivateKey || typeof rsaPrivateKey !== "string") {
-    res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
+  const record = await consumeRevokeToken(token);
+  if (!record) {
+    res.status(410).send(responseHtml("⏰ Link Already Used",
+      "This revoke link has already been used. " +
+      "If you still want to revoke access, please contact the system administrator.",
+      "#f59e0b"));
+    return;
   }
 
   try {
-    // Confirm record exists on-chain before fetching
-    try {
-      await contract.getIpfsHash(hashPatientId(id));
-    } catch (err: any) {
-      if (err.reason && err.reason.includes("Record not found")) {
-        res.status(404).json({ error: "Record not found on blockchain" }); return;
-      }
-      throw err;
+    const hospitalAddress = await getHospitalWalletAddress(record.hospitalEmail);
+    if (!hospitalAddress) {
+      res.status(500).send(responseHtml("⚠️ Unable to Revoke",
+        "The hospital's wallet address could not be found. Please contact the system administrator.",
+        "#f59e0b"));
+      return;
     }
 
-    // Use shared fetchVersionData helper — gets the latest version
-    // getRecordCount returns the current version number (latest)
-    const latestVersion = Number(await contract.getRecordCount(hashPatientId(id)));
-    const result1       = await fetchVersionData(id.toLowerCase(), latestVersion, res.locals.user.email, rsaPrivateKey);
+    await contract.revokeConsent(hashPatientId(record.patientId), hospitalAddress);
 
-    // k-set Byzantine consensus (n=5, f=1, k=2)
-    // Single-node deployment: fetch once from the authoritative source
-    // (blockchain + IPFS), then replicate the response to simulate the
-    // quorum of n=5 nodes agreeing. This satisfies the threshold=2
-    // requirement while avoiding redundant gas-burning blockchain calls.
-    const serialised     = JSON.stringify(result1);
-    const attempts: string[] = [serialised, serialised]; // quorum simulation
-
-    const agreed = simulateConsensus(attempts);
-    if (!agreed.length) {
-      res.status(500).json({ error: "Consensus failed: no consistent responses from nodes" }); return;
-    }
-
-    // Read wait-free register — confirms consent state before returning data
-    const register      = getOrCreateRegister(id.toLowerCase());
-    const registerState = register.read(res.locals.user.email);
-    if (registerState.value !== "approved") {
-      res.status(403).json({ error: "Patient consent not confirmed in distributed register" }); return;
-    }
-
-    res.json(JSON.parse(agreed[0]));
+    res.send(responseHtml("🚫 Access Revoked",
+      `You have successfully revoked access for the hospital associated with ` +
+      `Patient ID: <code>${escapeHtml(record.patientId)}</code>. ` +
+      `They can no longer retrieve your medical record. You may close this window.`,
+      "#ba1a1a"));
   } catch (err: any) {
-    if (err.message === "NO_KEY_FOR_HOSPITAL") {
-      res.status(403).json({ error: "No decryption key on file for your hospital account — your account may pre-date the per-hospital key upgrade. Contact the system administrator." }); return;
-    }
-    console.error("[get-record]", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ── POST /record-history/:patientId ─────────────────────────────────────────
-/**
- * Returns all encounter versions for a patient, newest first.
- * Requires approved consent in the wait-free register (same check as get-record).
- * Uses fetchVersionData() shared helper — no decrypt logic duplication.
- *
- * Each entry includes the HL7 FHIR Encounter label (Task 4 naming),
- * timestamp, encounter fields, and IPFS CID for provenance.
- */
-app.post("/record-history/:patientId", requireAuth, async (req: Request, res: Response) => {
-  const pid = String(req.params.patientId).trim().toLowerCase();
-  if (!pid || pid.length > 100) {
-    res.status(400).json({ error: "Invalid patient ID" }); return;
-  }
-
-  const { rsaPrivateKey } = req.body;
-  if (!rsaPrivateKey || typeof rsaPrivateKey !== "string") {
-    res.status(400).json({ error: "Your RSA private key is required to decrypt this record." }); return;
-  }
-
-  // Consent check — same wait-free register guard used in get-record
-  const register      = getOrCreateRegister(pid);
-  const registerState = register.read(res.locals.user.email);
-  if (registerState.value !== "approved") {
-    res.status(403).json({ error: "Patient consent not confirmed in distributed register" }); return;
-  }
-
-  try {
-    const count = Number(await contract.getRecordCount(hashPatientId(pid)));
-    if (count === 0) { res.status(404).json({ error: "Record not found" }); return; }
-
-    // Fetch all versions newest-first
-    const encounters = [];
-    for (let v = count; v >= 1; v--) {
-      const entry = await fetchVersionData(pid, v, res.locals.user.email, rsaPrivateKey);
-      const label = v === 1 ? "Initial Record" : `Encounter ${v - 1}`;
-      const hospitalName = await getHospitalNameByWallet(entry.hospital) ?? entry.hospital;
-      encounters.push({
-        label,
-        hospitalName,
-        version:            entry.version,
-        timestamp:          entry.timestamp,
-        ipfsHash:           entry.ipfsHash,
-        doctorName:         entry.doctorName,
-        department:         entry.department,
-        symptoms:           entry.symptoms,
-        diagnosis:          entry.diagnosis,
-        medication:         entry.medication,
-        dosage:             entry.dosage,
-        instructions:       entry.instructions,
-        allergies:          entry.allergies,
-        existingConditions: entry.existingConditions,
-      });
-    }
-
-    res.json({ patientId: pid, total: count, encounters });
-  } catch (err: any) {
-    if (err.message === "NO_KEY_FOR_HOSPITAL") {
-      res.status(403).json({ error: "No decryption key on file for your hospital account — your account may pre-date the per-hospital key upgrade. Contact the system administrator." }); return;
-    }
-    console.error("[record-history]", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("[access/revoke-respond]", err);
+    res.status(500).send(responseHtml("⚠️ System Error",
+      "An error occurred while revoking access. Please try again.",
+      "#f59e0b"));
   }
 });
 

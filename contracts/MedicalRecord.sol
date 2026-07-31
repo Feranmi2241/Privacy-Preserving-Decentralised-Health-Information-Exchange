@@ -21,8 +21,9 @@ pragma solidity ^0.8.28;
  *    IDs submitted by the calling hospital, preventing cross-hospital
  *    enumeration of patient identities.
  *
- * 4. Access audit events — every read is logged on-chain, providing the
- *    immutable audit trail required by a healthcare HIE.
+ * 4. Audit events — writes (RecordAdded) and consent changes (ConsentGranted/
+ *    ConsentRevoked) are permanently logged on-chain. Reads are view calls —
+ *    free, unlogged, and verified client-side via the hospital's own wallet.
  *
  * Professor alignment:
  *   - Prof. Zhan (Information Assurance): hybrid encryption + on-chain
@@ -66,13 +67,6 @@ contract MedicalRecord {
         uint256         timestamp
     );
 
-    event RecordAccessed(
-        string  indexed patientId,
-        address indexed accessor,
-        uint256         version,
-        uint256         timestamp
-    );
-
     event ConsentGranted(string indexed patientId, address indexed hospital);
     event ConsentRevoked(string indexed patientId, address indexed hospital);
 
@@ -108,11 +102,7 @@ contract MedicalRecord {
      * Can be called by the owner (acting as patient guardian) or the
      * hospital that originally stored the record.
      */
-    function grantConsent(string memory _patientId, address _hospital) external {
-        require(
-            msg.sender == owner || msg.sender == _hospital,
-            "Not authorised to grant consent"
-        );
+    function grantConsent(string memory _patientId, address _hospital) external onlyOwner {
         patientConsent[_patientId][_hospital] = true;
         emit ConsentGranted(_patientId, _hospital);
     }
@@ -200,6 +190,7 @@ contract MedicalRecord {
      */
     function getRecord(string memory _patientId)
         public
+        view
         onlyAuthorized
         returns (
             string memory patientId,
@@ -218,8 +209,6 @@ contract MedicalRecord {
 
         Record storage r = records[_patientId][records[_patientId].length - 1];
 
-        emit RecordAccessed(_patientId, msg.sender, r.version, block.timestamp);
-
         return (
             r.patientId,
             r.ipfsHash,
@@ -233,6 +222,7 @@ contract MedicalRecord {
     // ── Read: specific version ────────────────────────────────────────────────
     function getRecordVersion(string memory _patientId, uint256 _version)
         public
+        view
         onlyAuthorized
         returns (
             string memory ipfsHash,
@@ -249,8 +239,6 @@ contract MedicalRecord {
         );
 
         Record storage r = records[_patientId][_version - 1];
-
-        emit RecordAccessed(_patientId, msg.sender, _version, block.timestamp);
 
         return (r.ipfsHash, r.previousIpfsHash, r.hospital, r.timestamp);
     }

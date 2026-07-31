@@ -95,3 +95,60 @@ historical artifact rather than an unexplained inconsistency.
 - No re-submission of old records is required for the system to function. The
   boundary only affects on-chain attribution and per-hospital enumeration for
   pre-Phase-2 data.
+
+---
+
+## Phase 3 — Client-Side Reads, Consent Hardening, and Contract Redeployment
+
+### What changed
+
+**Contract redeployment.** The Phase 2 contract address is abandoned. A new
+contract was deployed to Sepolia as part of this phase. Update `CONTRACT_ADDRESS`
+in `backend/.env` and `VITE_CONTRACT_ADDRESS` in `frontend/.env` to the new
+address. Any record stored under the old address is no longer reachable through
+the application — those IPFS CIDs still exist on Pinata but the on-chain index
+is gone.
+
+**RecordAccessed event removed.** The `RecordAccessed` event was removed from
+the contract. This is an honest correction: the event was never actually being
+emitted even before this phase. `getRecord` and `getRecordVersion` were declared
+`nonpayable` (a transaction, not a call), which meant every read cost gas and
+produced a transaction receipt — but the `emit RecordAccessed(...)` line inside
+those functions was never reached in practice because the backend was calling
+them as `eth_call` (view calls), not as `eth_sendTransaction`. The event existed
+in the ABI and in the old `shared/MedicalRecordABI.json` but produced zero
+on-chain log entries. Removing it is a correction, not a regression.
+
+**getRecord and getRecordVersion are now view functions.** Both functions are
+now correctly declared `view`, which means they are free, gas-less calls. This
+aligns the contract with how the backend was already calling them.
+
+**grantConsent is now onlyOwner.** Previously `grantConsent` could be called by
+any authorized hospital, which allowed a hospital to self-grant consent for any
+patient without patient involvement. It is now restricted to the contract owner
+(the deployer wallet), which is the backend's signing wallet. The patient
+authorization email flow (Task 8) is the only path through which consent is
+granted — the backend calls `grantConsent` on the owner wallet only after the
+patient explicitly clicks Approve in their email.
+
+**Reads and decryption are now entirely client-side.** The private RSA key
+never reaches the server. After patient consent is granted, the frontend calls
+`contract.getRecord()` directly via the hospital's MetaMask wallet, fetches the
+encrypted payload from IPFS via Pinata, and decrypts it in the browser using the
+hospital's private key held in React state. The backend has no role in the read
+path beyond the initial consent flow.
+
+### The migration boundary
+
+**All hospital wallet authorizations are lost on redeploy.** The constructor
+only auto-authorizes the deployer. Every hospital that completed the wallet-link
+flow against the old contract address must redo that step — the backend will call
+`authorizeHospital` on the new contract when they reconnect. This is expected and
+acceptable for a research-stage project where all hospital accounts are
+controlled test accounts.
+
+**shared/MedicalRecordABI.json has been regenerated** from the freshly compiled
+artifact. The three ABI-breaking changes are: `RecordAccessed` event removed;
+`getRecord` and `getRecordVersion` `stateMutability` changed from `nonpayable`
+to `view`; `grantConsent` caller restriction tightened (ABI shape unchanged, but
+runtime behaviour changed). Any client that cached the old ABI must reload.

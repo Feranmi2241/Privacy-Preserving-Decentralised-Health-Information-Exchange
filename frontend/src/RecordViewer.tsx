@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import PatientForm from './PatientForm';
+import { fetchLatestRecordFromChain, fetchRecordFromChain, getRecordVersionCount } from './utils/fetchOnChainRecord';
 
 interface FullRecord {
   patientId: string; fullName: string; dateOfBirth: string; patientEmail: string;
@@ -73,7 +74,7 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
   );
 }
 
-export default function RecordViewer({ token, rsaKey, onRsaKey }: { token: string; rsaKey: string; onRsaKey: (k: string) => void }) {
+export default function RecordViewer({ token, rsaKey, onRsaKey, email }: { token: string; rsaKey: string; onRsaKey: (k: string) => void; email: string }) {
   const [step, setStep]           = useState<Step>('search');
   const [patientId, setPatientId] = useState('');
   const [loading, setLoading]     = useState(false);
@@ -161,21 +162,16 @@ export default function RecordViewer({ token, rsaKey, onRsaKey }: { token: strin
     if (!useKey) { resolveKey(k => fetchRecord(pid, k)); return; }
     setLoading(true);
     try {
-      const res = await fetch(
-        `${import.meta.env.VITE_API_URL}/get-record/${encodeURIComponent(pid)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ rsaPrivateKey: useKey }),
-        }
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to retrieve record');
+      const data = await fetchLatestRecordFromChain(pid, email, useKey);
       setRecord(data);
       setStep('result');
       fetchHistory(pid, useKey);
     } catch (err: any) {
-      setError(err.message);
+      if (err.message === 'NO_KEY_FOR_HOSPITAL') {
+        setError('You do not have a decryption key for this record.');
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
@@ -187,16 +183,37 @@ export default function RecordViewer({ token, rsaKey, onRsaKey }: { token: strin
     if (!useKey) return;
     setHistoryLoading(true);
     try {
-      const res = await fetch(
-        `${import.meta.env.VITE_API_URL}/record-history/${encodeURIComponent(pid)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ rsaPrivateKey: useKey }),
-        }
-      );
-      const data = await res.json();
-      if (res.ok) setHistory(data.encounters || []);
+      const count = await getRecordVersionCount(pid);
+      const encounters: EncounterEntry[] = [];
+      for (let v = count; v >= 1; v--) {
+        const entry = await fetchRecordFromChain(pid, v, email, useKey);
+        // Resolve hospital wallet address to a human-readable name
+        let hospitalName = entry.hospital;
+        try {
+          const res = await fetch(
+            `${import.meta.env.VITE_API_URL}/hospital/by-wallet/${encodeURIComponent(entry.hospital)}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (res.ok) { const d = await res.json(); hospitalName = d.name || entry.hospital; }
+        } catch { /* non-fatal — fall back to wallet address */ }
+        encounters.push({
+          label:              v === 1 ? 'Initial Record' : `Encounter ${v - 1}`,
+          version:            entry.version,
+          timestamp:          entry.timestamp,
+          ipfsHash:           entry.ipfsHash,
+          hospitalName,
+          doctorName:         entry.doctorName,
+          department:         entry.department,
+          symptoms:           entry.symptoms,
+          diagnosis:          entry.diagnosis,
+          medication:         entry.medication,
+          dosage:             entry.dosage,
+          instructions:       entry.instructions,
+          allergies:          entry.allergies,
+          existingConditions: entry.existingConditions,
+        });
+      }
+      setHistory(encounters);
     } catch { /* non-fatal */ } finally {
       setHistoryLoading(false);
     }
@@ -455,6 +472,8 @@ export default function RecordViewer({ token, rsaKey, onRsaKey }: { token: strin
             >✕</button>
             <PatientForm
               token={token}
+              rsaKey={rsaKey}
+              email={email}
               encounterContext={{
                 patientId: record.patientId,
                 previousIpfsHash: record.ipfsHash,

@@ -2,6 +2,34 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!--
+      Content-Security-Policy — restricts what this page's own JS can load/connect to.
+      Delivered as a <meta> tag because this project is not deployed behind a server
+      that can set real HTTP headers. A true HTTP header (e.g. via vercel.json "headers"
+      or an Express helmet() call on a static-file server) is preferable if deployment
+      infrastructure allows it later — a meta tag can theoretically be stripped by a
+      compromised page before it takes effect, which is not possible with a real header.
+
+      connect-src is intentionally limited to the two origins this page's own fetch()
+      calls directly: the backend API and the Pinata IPFS gateway. The Sepolia RPC
+      provider is deliberately excluded — window.ethereum.request() is handled by the
+      MetaMask extension's isolated context and never goes through the page's own
+      fetch/XHR, so connect-src does not govern it and adding it would grant an
+      unnecessary permission to a channel this page never uses directly.
+
+      IMPORTANT: update connect-src when VITE_API_URL or VITE_PINATA_GATEWAY change
+      for production deployment.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src  'self';
+      style-src   'self' 'unsafe-inline' https://fonts.googleapis.com;
+      font-src    'self' https://fonts.gstatic.com;
+      img-src     'self' data: blob:;
+      connect-src 'self' http://localhost:5000 https://*.mypinata.cloud;
+      object-src  'none';
+      frame-src   'none';
+    " />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Clinical Ledger | Health Blockchain HIE</title>

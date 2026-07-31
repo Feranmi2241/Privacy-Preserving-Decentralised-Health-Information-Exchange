@@ -9,7 +9,7 @@ declare global {
 
 type AuthStep = 'login' | 'register' | 'verify-otp' | 'forgot' | 'reset-password' | 'connect-wallet';
 
-interface Props { onAuth: (token: string, hospitalName: string, rsaKey: string) => void; }
+interface Props { onAuth: (token: string, hospitalName: string, rsaKey: string, email: string) => void; }
 
 const API = import.meta.env.VITE_API_URL;
 
@@ -278,7 +278,7 @@ export default function AuthPage({ onAuth }: Props) {
     try {
       if (step === 'login') {
         const data = await post('/auth/login', { email: form.email, password: form.password });
-        onAuth(data.token, data.hospitalName, '');
+        onAuth(data.token, data.hospitalName, '', form.email);
 
       } else if (step === 'register') {
         if (!form.termsAccepted) {

@@ -100,6 +100,16 @@ export async function initializeDatabase(): Promise<void> {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS revoke_tokens (
+        token       VARCHAR(64) PRIMARY KEY,
+        patient_id  VARCHAR(100) NOT NULL,
+        hospital_email TEXT NOT NULL,
+        used        BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at  TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS access_requests (
         token VARCHAR(64) PRIMARY KEY,
         patient_id VARCHAR(100) NOT NULL,
@@ -563,6 +573,41 @@ export async function getAccessRequestTimeRemaining(patientId: string, hospitalE
     );
     if (result.rows.length === 0) return 0;
     return Math.max(0, Number(result.rows[0].expires_at) - Date.now());
+  } finally { client.release(); }
+}
+
+// ── Revoke token helpers ─────────────────────────────────────────────────────
+// Tokens are single-use with no expiry — a patient may revoke access at any
+// time after granting it, even long after the original approval.
+export async function createRevokeToken(patientId: string, hospitalEmail: string): Promise<string> {
+  const token  = crypto.randomBytes(32).toString("hex");
+  const client = await pool.connect();
+  try {
+    await client.query(
+      "INSERT INTO revoke_tokens (token, patient_id, hospital_email) VALUES ($1, $2, $3)",
+      [token, patientId.toLowerCase(), encryptColumn(hospitalEmail.toLowerCase())]
+    );
+    return token;
+  } finally { client.release(); }
+}
+
+// Returns { patientId, hospitalEmail } if the token is valid and unused, then
+// marks it used atomically. Returns null if not found or already used.
+export async function consumeRevokeToken(
+  token: string
+): Promise<{ patientId: string; hospitalEmail: string } | null> {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `UPDATE revoke_tokens SET used = TRUE
+       WHERE token = $1 AND used = FALSE
+       RETURNING patient_id, hospital_email`,
+      [token]
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    const hospitalEmail = (() => { try { return decryptColumn(row.hospital_email); } catch { return row.hospital_email; } })();
+    return { patientId: row.patient_id, hospitalEmail };
   } finally { client.release(); }
 }
 

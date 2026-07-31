@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { ethers } from 'ethers';
 import MedicalRecordABI from '../../shared/MedicalRecordABI.json';
+import { fetchLatestRecordFromChain } from './utils/fetchOnChainRecord';
 
 declare global { interface Window { ethereum?: any; } }
 
@@ -23,8 +24,10 @@ interface EncounterContext {
 
 interface Props {
   token: string;
+  rsaKey?: string;
+  email?: string;
   onRecordAdded?: () => void;
-  encounterContext?: EncounterContext; // when set → amendment / encounter mode
+  encounterContext?: EncounterContext;
 }
 
 interface Result { txHash: string; ipfsHash: string; hadPhoto: boolean; }
@@ -91,7 +94,7 @@ function Field({ label, required, children }: { label: string; required?: boolea
   );
 }
 
-export default function PatientForm({ token, onRecordAdded, encounterContext }: Props) {
+export default function PatientForm({ token, rsaKey, email, onRecordAdded, encounterContext }: Props) {
   const isEncounter = !!encounterContext;
 
   const [form, setForm] = useState<FormState>({
@@ -195,8 +198,40 @@ export default function PatientForm({ token, onRecordAdded, encounterContext }: 
       if (isEncounter) {
         body.patientId        = encounterContext!.patientId;
         body.previousIpfsHash = encounterContext!.previousIpfsHash;
-        body.allergiesUnchanged  = allergiesMode  === 'unchanged';
-        body.conditionsUnchanged = conditionsMode === 'unchanged';
+
+        // Fetch and decrypt the previous version in the browser.
+        // The private key never leaves the client — this replaces the
+        // server-side backfill that used to require rsaPrivateKey in the body.
+        if (!rsaKey || !email) {
+          setError('Your RSA private key is required to add an encounter. Please reload and re-enter your key.');
+          setLoading(false);
+          return;
+        }
+        let prev: Awaited<ReturnType<typeof fetchLatestRecordFromChain>>;
+        try {
+          prev = await fetchLatestRecordFromChain(encounterContext!.patientId, email, rsaKey);
+        } catch (fetchErr: any) {
+          setError('Could not load previous record for backfill: ' + (fetchErr.message || 'Unknown error'));
+          setLoading(false);
+          return;
+        }
+
+        // Resolve profile fields: use form value if supplied, otherwise carry forward from previous version
+        body.fullName      = form.fullName.trim()      || prev.fullName;
+        body.dateOfBirth   = form.dateOfBirth.trim()   || prev.dateOfBirth;
+        body.patientEmail  = form.patientEmail.trim()  || prev.patientEmail;
+        body.phone         = form.phone.trim()         || prev.phone;
+        body.address       = form.address.trim()       || prev.address;
+        body.bloodGroup    = form.bloodGroup.trim()    || prev.bloodGroup;
+        body.profilePhoto  = form.profilePhoto         || prev.profilePhoto;
+
+        // Allergies / conditions: use previous version's values when "unchanged" is selected
+        body.allergies          = allergiesMode  === 'unchanged' ? prev.allergies          : form.allergies;
+        body.existingConditions = conditionsMode === 'unchanged' ? prev.existingConditions : form.existingConditions;
+
+        // Remove the toggle flags — backend now receives resolved values directly
+        delete body.allergiesUnchanged;
+        delete body.conditionsUnchanged;
       }
 
       // Step 1 — encrypt + pin to IPFS, get back args for storeRecord

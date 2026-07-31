@@ -1,15 +1,17 @@
 import { expect } from "chai";
-import { ethers } from "hardhat";
-import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
+import { network } from "hardhat";
+import type { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/types";
 
 describe("MedicalRecord", function () {
   let contract: any;
+  let ethers: any;
   let owner: HardhatEthersSigner;
   let hospital1: HardhatEthersSigner;
   let hospital2: HardhatEthersSigner;
   let stranger: HardhatEthersSigner;
 
   beforeEach(async function () {
+    ({ ethers } = await network.connect());
     [owner, hospital1, hospital2, stranger] = await ethers.getSigners();
     const factory = await ethers.getContractFactory("MedicalRecord");
     contract = await factory.deploy();
@@ -60,7 +62,7 @@ describe("MedicalRecord", function () {
     const ipfsHash  = "QmTestHash123";
 
     it("authorised hospital can store a first record", async function () {
-      await expect(contract.storeRecord(patientId, ipfsHash, "")).to.not.be.reverted;
+      await expect(contract.storeRecord(patientId, ipfsHash, "")).to.not.revert(ethers);
     });
 
     it("emits RecordAdded event with correct fields", async function () {
@@ -92,14 +94,14 @@ describe("MedicalRecord", function () {
       await contract.storeRecord(patientId, ipfsHash, "");
       await expect(
         contract.storeRecord(patientId, "QmNewHash", ipfsHash)
-      ).to.not.be.reverted;
+      ).to.not.revert(ethers);
     });
 
     it("newly authorised hospital can store a record", async function () {
       await contract.authorizeHospital(hospital1.address);
       await expect(
         contract.connect(hospital1).storeRecord("PAT-002", "QmHospital1Hash", "")
-      ).to.not.be.reverted;
+      ).to.not.revert(ethers);
     });
 
     it("revoked hospital cannot store a record", async function () {
@@ -142,7 +144,6 @@ describe("MedicalRecord", function () {
 
     it("hospital without consent cannot retrieve a record", async function () {
       await contract.authorizeHospital(hospital1.address);
-      // hospital1 is authorized but has no consent for this patient
       await expect(
         contract.connect(hospital1).getRecord(patientId)
       ).to.be.revertedWith("No patient consent for this hospital");
@@ -151,7 +152,7 @@ describe("MedicalRecord", function () {
     it("hospital with granted consent can retrieve a record", async function () {
       await contract.authorizeHospital(hospital1.address);
       await contract.grantConsent(patientId, hospital1.address);
-      await expect(contract.connect(hospital1).getRecord(patientId)).to.not.be.reverted;
+      await expect(contract.connect(hospital1).getRecord(patientId)).to.not.revert(ethers);
     });
 
     it("revoked consent blocks retrieval", async function () {
@@ -160,6 +161,58 @@ describe("MedicalRecord", function () {
       await contract.revokeConsent(patientId, hospital1.address);
       await expect(
         contract.connect(hospital1).getRecord(patientId)
+      ).to.be.revertedWith("No patient consent for this hospital");
+    });
+  });
+
+  // ── grantConsent access control ─────────────────────────────────────────────
+  describe("grantConsent", function () {
+    it("non-owner cannot grant consent", async function () {
+      await contract.authorizeHospital(hospital1.address);
+      await contract.storeRecord("PAT-001", "QmHash1", "");
+      await expect(
+        contract.connect(hospital1).grantConsent("PAT-001", hospital1.address)
+      ).to.be.revertedWith("Not owner");
+    });
+  });
+
+  // ── Per-hospital consent isolation ──────────────────────────────────────────
+  describe("Per-hospital consent isolation", function () {
+    it("consent granted to hospital1 does not extend to hospital2", async function () {
+      await contract.authorizeHospital(hospital1.address);
+      await contract.authorizeHospital(hospital2.address);
+
+      await contract.storeRecord("PAT-001", "QmHash1", "");
+      await contract.grantConsent("PAT-001", hospital1.address);
+
+      // hospital1 has consent — should succeed
+      await expect(
+        contract.connect(hospital1).getRecord("PAT-001")
+      ).to.not.revert(ethers);
+
+      // hospital2 has no consent — should revert
+      await expect(
+        contract.connect(hospital2).getRecord("PAT-001")
+      ).to.be.revertedWith("No patient consent for this hospital");
+    });
+  });
+
+  // ── revokeConsent ────────────────────────────────────────────────────────────
+  describe("revokeConsent", function () {
+    it("owner can revoke consent and access is blocked immediately", async function () {
+      await contract.authorizeHospital(hospital1.address);
+      await contract.storeRecord("PAT-001", "QmHash1", "");
+      await contract.grantConsent("PAT-001", hospital1.address);
+
+      // Confirm access works before revocation
+      await expect(
+        contract.connect(hospital1).getRecord("PAT-001")
+      ).to.not.revert(ethers);
+
+      // Revoke and confirm access is now blocked
+      await contract.revokeConsent("PAT-001", hospital1.address);
+      await expect(
+        contract.connect(hospital1).getRecord("PAT-001")
       ).to.be.revertedWith("No patient consent for this hospital");
     });
   });
@@ -178,11 +231,9 @@ describe("MedicalRecord", function () {
       await contract.storeRecord("PAT-002", "QmHash2", "");
       await contract.connect(hospital1).storeRecord("PAT-H1", "QmHashH1", "");
 
-      // Owner sees only its own patients
       const ownerIds = await contract.getAllPatientIds();
       expect(ownerIds).to.deep.equal(["PAT-001", "PAT-002"]);
 
-      // hospital1 sees only its own patients
       const h1Ids = await contract.connect(hospital1).getAllPatientIds();
       expect(h1Ids).to.deep.equal(["PAT-H1"]);
     });
@@ -203,8 +254,10 @@ describe("MedicalRecord", function () {
       await contract.connect(hospital1).storeRecord("PAT-H1", "QmH1Hash", "");
       await contract.connect(hospital2).storeRecord("PAT-H2", "QmH2Hash", "");
 
-      const [, , , h1Addr] = await contract.getRecord("PAT-H1");
-      const [, , , h2Addr] = await contract.getRecord("PAT-H2");
+      // Each hospital stored their own record — auto-consent applies to the
+      // storing hospital. Read back as the storing hospital (msg.sender matches).
+      const [, , , h1Addr] = await contract.connect(hospital1).getRecord("PAT-H1");
+      const [, , , h2Addr] = await contract.connect(hospital2).getRecord("PAT-H2");
 
       expect(h1Addr).to.equal(hospital1.address);
       expect(h2Addr).to.equal(hospital2.address);

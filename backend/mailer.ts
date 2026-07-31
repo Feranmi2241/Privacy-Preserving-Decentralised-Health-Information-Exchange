@@ -190,6 +190,47 @@ export async function sendPatientAuthorizationRequest(
       </div>`));
 }
 
+// ── Patient access confirmation (with revoke link) ──────────────────────────
+export async function sendPatientAccessConfirmation(
+  patientEmail: string, patientId: string, hospitalName: string, revokeLink: string
+): Promise<void> {
+  const safeHospitalName = escapeHtml(hospitalName);
+  const safePatientId    = escapeHtml(patientId);
+  await sendEmail(patientEmail, `Access Granted to ${hospitalName} — You Can Revoke Anytime`,
+    emailWrapper("✅", "Clinical Ledger HIE", "Access Confirmation · Patient-Controlled Health Records", `
+      <p style="margin-bottom:16px;color:#3f4949">
+        You approved access to your medical record for <strong>${safeHospitalName}</strong>.
+        You can revoke this access at any time using the button below.
+      </p>
+      <div style="padding:16px;background:#f0f4f8;border-radius:12px;border:1px solid #dfe3e7;margin-bottom:24px">
+        <table style="width:100%;font-size:13px;border-collapse:collapse">
+          <tr>
+            <td style="padding:8px 0;color:#6f7979;font-weight:600;width:130px">Patient ID</td>
+            <td style="padding:8px 0;color:#171c1f;font-weight:700;font-family:monospace">${safePatientId}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0;color:#6f7979;font-weight:600">Hospital</td>
+            <td style="padding:8px 0;color:#00464a;font-weight:700">${safeHospitalName}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0;color:#6f7979;font-weight:600">Status</td>
+            <td style="padding:8px 0;color:#00464a;font-weight:800">✅ APPROVED</td>
+          </tr>
+        </table>
+      </div>
+      <a href="${revokeLink}"
+         style="display:inline-block;padding:16px 28px;
+                background:linear-gradient(135deg,#ba1a1a,#93000a);
+                color:#ffffff;text-decoration:none;border-radius:12px;
+                font-weight:800;font-size:15px">
+        🚫 Revoke Access
+      </a>
+      <p style="margin-top:20px;font-size:12px;color:#6f7979">
+        This revoke link is single-use and does not expire.
+        Keep this email if you may want to revoke access later.
+      </p>`));
+}
+
 // ── Hospital access granted notification ──────────────────────────────────────
 export async function sendAccessGrantedNotification(
   hospitalEmail: string, hospitalName: string, patientId: string
