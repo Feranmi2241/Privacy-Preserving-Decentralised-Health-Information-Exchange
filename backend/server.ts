@@ -50,7 +50,6 @@ function hashPatientId(patientId: string): string {
   return keccak256(toUtf8Bytes(patientId.trim().toLowerCase()));
 }
 import { encryptRecord, decryptRecord, EncryptedPayload, generateRSAKeyPair } from "./encryption";
-import simulateConsensus from "./consensusSimulation";
 import { getOrCreateRegister, getRegisterHistory } from "./waitFreeRegister";
 import {
   findHospital, createHospital, markVerified, updatePassword,

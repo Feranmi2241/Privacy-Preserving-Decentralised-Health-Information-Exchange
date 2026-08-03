@@ -5,7 +5,7 @@ A privacy-preserving, decentralised Health Information Exchange (HIE) built on E
 ## Architecture
 
 - **Smart Contract** (`contracts/MedicalRecord.sol`) — append-only versioned record registry with hospital access control, patient consent model, and on-chain audit events
-- **Backend** (`backend/server.ts`) — Express API; hybrid-encrypts records (AES-256-CBC + RSA-2048) before pinning to IPFS via Pinata; applies k-set Byzantine consensus on retrieval; implements email-based patient authorization
+- **Backend** (`backend/server.ts`) — Express API; hybrid-encrypts records (AES-256-GCM + RSA-OAEP, per-hospital keypairs) before pinning to IPFS via Pinata; implements email-based patient authorization. Decryption never happens server-side — the RSA private key never leaves the browser.
 - **Wait-Free Register** (`backend/waitFreeRegister.ts`) — atomic MRMW shared register simulation (Prof. Chaudhuri, Iowa State) for distributed consent state management
 - **Frontend** (`frontend/`) — React + Vite dashboard for hospitals to add and view patient records with asynchronous patient authorization flow
 
@@ -44,9 +44,9 @@ PRIVATE_KEY=<your wallet private key>
 PINATA_JWT=<your Pinata JWT>
 PINATA_GATEWAY=<your Pinata gateway domain>
 
-# RSA-2048 encryption keys (generated in step 2)
+# RSA-OAEP public key — used server-side to encrypt records for each hospital.
+# The matching private key is held only in the hospital's browser and is never sent to the server.
 RSA_PUBLIC_KEY="<output from generateKeys.ts>"
-RSA_PRIVATE_KEY="<output from generateKeys.ts>"
 
 # Auth — generate with: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 SESSION_SECRET=<minimum 64 random characters>
@@ -70,6 +70,19 @@ PORT=5000
 
 The `frontend/.env` is pre-configured with `VITE_API_URL=http://localhost:5000`.
 For production, set `VITE_API_URL` to your deployed backend URL.
+
+The frontend also requires five IPFS gateway URLs for k-set Byzantine consensus (n=5, f=1).
+These are already set in `frontend/.env`; replace the Pinata subdomain placeholder with your own:
+
+```
+VITE_IPFS_GATEWAY_1=https://<your-pinata-subdomain>.mypinata.cloud/ipfs/
+VITE_IPFS_GATEWAY_2=https://ipfs.io/ipfs/
+VITE_IPFS_GATEWAY_3=https://dweb.link/ipfs/
+VITE_IPFS_GATEWAY_4=https://cloudflare-ipfs.com/ipfs/
+VITE_IPFS_GATEWAY_5=https://4everland.io/ipfs/
+```
+
+All five must be set. If fewer than 2 are reachable at runtime the frontend throws `INSUFFICIENT_GATEWAYS_RESPONDED`; if fewer than 2 are configured it throws `INSUFFICIENT_GATEWAYS_CONFIGURED`.
 
 ### 4. Deploy the smart contract
 
@@ -129,9 +142,9 @@ This system implements an **email-based, asynchronous access control model** —
 
 ### When a hospital tries to view a patient record:
 
-1. Hospital enters the **Patient ID**, **Tx Hash**, and **IPFS CID**
-2. System verifies the Tx Hash and IPFS CID against the blockchain
-3. If valid — a **cryptographically secure 256-bit token** is generated (20-minute TTL, one-time use)
+1. Hospital enters the **Patient ID**
+2. Backend confirms the record exists on-chain via `getIpfsHash()` — no client-supplied hash needed
+3. A **cryptographically secure 256-bit token** is generated (20-minute TTL, one-time use)
 4. An authorization email is sent to the **patient's registered email address** with Approve and Deny buttons
 5. Hospital is shown a **waiting page** with a live countdown timer
 6. The frontend **polls every 5 seconds** for the patient's response

@@ -12,6 +12,7 @@ import { ethers } from "ethers";
 import MedicalRecordABI from "../../../shared/MedicalRecordABI.json";
 import { hashPatientId } from "./hashPatientId";
 import { decryptRecordBrowser, type EncryptedPayload } from "./decryptRecord";
+import simulateConsensus from "./consensusSimulation";
 
 const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS as string;
 
@@ -38,12 +39,50 @@ async function getContract() {
   return new ethers.Contract(CONTRACT_ADDRESS, MedicalRecordABI, signer);
 }
 
+// Five gateways required by the Byzantine fault tolerance formula n > 3f + 1 (n=5, f=1).
+// Passing the fixed configured count (GATEWAYS.length) as n — not successful.length —
+// keeps k = n - 3f = 2 stable regardless of how many gateways respond on a given request.
+// Passing successful.length instead would cause k to compute to a negative number when
+// fewer than 4 gateways respond (e.g. 2 - 3 = -1), and array.slice(0, -1) silently drops
+// the last valid element rather than throwing — real, silent data corruption.
+const GATEWAYS = [
+  import.meta.env.VITE_IPFS_GATEWAY_1,
+  import.meta.env.VITE_IPFS_GATEWAY_2,
+  import.meta.env.VITE_IPFS_GATEWAY_3,
+  import.meta.env.VITE_IPFS_GATEWAY_4,
+  import.meta.env.VITE_IPFS_GATEWAY_5,
+].filter((url): url is string => Boolean(url)); // tolerate a missing var rather than crashing
+
 async function fetchFromIpfs(ipfsHash: string): Promise<EncryptedPayload> {
-  const gateway = import.meta.env.VITE_PINATA_GATEWAY as string;
-  const url = `https://${gateway}/ipfs/${ipfsHash}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`IPFS fetch failed: ${res.status}`);
-  return res.json();
+  if (GATEWAYS.length < 2) {
+    throw new Error("INSUFFICIENT_GATEWAYS_CONFIGURED");
+  }
+
+  const results = await Promise.allSettled(
+    GATEWAYS.map(async (base) => {
+      const res = await fetch(base + ipfsHash);
+      if (!res.ok) throw new Error(`Gateway fetch failed: ${res.status}`);
+      return res.text(); // fetch as text so simulateConsensus can compare raw strings
+    })
+  );
+
+  const successful = results
+    .filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled")
+    .map((r) => r.value);
+
+  if (successful.length < 2) {
+    throw new Error("INSUFFICIENT_GATEWAYS_RESPONDED");
+  }
+
+  // Must pass GATEWAYS.length (the configured n=5), not successful.length —
+  // see comment above the GATEWAYS array for why this matters.
+  const agreed = simulateConsensus(successful, GATEWAYS.length, 1);
+  if (agreed.length === 0) {
+    throw new Error("CONSENSUS_FAILED");
+  }
+
+  // agreed[0] is the majority-agreed-upon raw JSON text — parse it now
+  return JSON.parse(agreed[0]) as EncryptedPayload;
 }
 
 // ─── Exported types ───────────────────────────────────────────────────────────

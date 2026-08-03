@@ -169,6 +169,12 @@ export default function RecordViewer({ token, rsaKey, onRsaKey, email }: { token
     } catch (err: any) {
       if (err.message === 'NO_KEY_FOR_HOSPITAL') {
         setError('You do not have a decryption key for this record.');
+      } else if (err.message === 'INSUFFICIENT_GATEWAYS_CONFIGURED') {
+        setError('This app isn\'t fully configured to verify record integrity. Please contact your administrator.');
+      } else if (err.message === 'INSUFFICIENT_GATEWAYS_RESPONDED') {
+        setError('Could not verify this record\'s integrity — fewer than 2 independent sources responded. Please try again.');
+      } else if (err.message === 'CONSENSUS_FAILED') {
+        setError('The sources for this record\'s data did not agree — this may indicate a network issue or a corrupted source. Please try again or contact support.');
       } else {
         setError(err.message);
       }
@@ -214,7 +220,16 @@ export default function RecordViewer({ token, rsaKey, onRsaKey, email }: { token
         });
       }
       setHistory(encounters);
-    } catch { /* non-fatal */ } finally {
+    } catch (err: any) {
+      if (err.message === 'INSUFFICIENT_GATEWAYS_CONFIGURED') {
+        setError('This app isn\'t fully configured to verify record integrity. Please contact your administrator.');
+      } else if (err.message === 'INSUFFICIENT_GATEWAYS_RESPONDED') {
+        setError('Could not verify this record\'s integrity — fewer than 2 independent sources responded. Please try again.');
+      } else if (err.message === 'CONSENSUS_FAILED') {
+        setError('The sources for this record\'s data did not agree — this may indicate a network issue or a corrupted source. Please try again or contact support.');
+      }
+      // other errors are non-fatal for history — the main record is already displayed
+    } finally {
       setHistoryLoading(false);
     }
   };
