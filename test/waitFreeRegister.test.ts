@@ -26,7 +26,7 @@
  */
 
 import { expect } from "chai";
-import { getOrCreateRegister, type WaitFreeRegister, type RegisterEntry } from "../backend/waitFreeRegister";
+import { getOrCreateRegister, type WaitFreeRegister, type RegisterEntry } from "../shared/waitFreeRegister.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

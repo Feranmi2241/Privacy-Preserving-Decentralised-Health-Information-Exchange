@@ -11,26 +11,23 @@ if (!RPC_URL || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
 }
 
 // ── ABI ───────────────────────────────────────────────────────────────────────
-// __dirname always resolves to the directory of THIS file (backend/ when
-// running via ts-node, backend/dist/ when compiled). Using process.cwd()+".."
-// breaks on Vercel where cwd() is /var/task, not the backend directory.
+// __dirname is backend/ under ts-node and backend/dist/ when compiled.
+// One ".." from backend/ and two ".." from backend/dist/ both reach the
+// project root — so we try one level up first, then two, to handle both.
 
-const ABI_PATH = path.join(
-  __dirname,
-  "..",
-  "..",
-  "artifacts",
-  "contracts",
-  "MedicalRecord.sol",
-  "MedicalRecord.json"
-);
-
-if (!fs.existsSync(ABI_PATH)) {
+function findAbiPath(): string {
+  const rel = path.join("artifacts", "contracts", "MedicalRecord.sol", "MedicalRecord.json");
+  const oneLevelUp  = path.join(__dirname, "..",      rel);
+  const twoLevelsUp = path.join(__dirname, "..", "..", rel);
+  if (fs.existsSync(oneLevelUp))  return oneLevelUp;
+  if (fs.existsSync(twoLevelsUp)) return twoLevelsUp;
   throw new Error(
-    `Contract ABI not found at ${ABI_PATH}. ` +
+    `Contract ABI not found at either:\n  ${oneLevelUp}\n  ${twoLevelsUp}\n` +
     "Run: npx hardhat compile"
   );
 }
+
+const ABI_PATH = findAbiPath();
 
 const contractABI: any[] = JSON.parse(
   fs.readFileSync(ABI_PATH, "utf8")

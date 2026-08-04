@@ -152,3 +152,107 @@ artifact. The three ABI-breaking changes are: `RecordAccessed` event removed;
 `getRecord` and `getRecordVersion` `stateMutability` changed from `nonpayable`
 to `view`; `grantConsent` caller restriction tightened (ABI shape unchanged, but
 runtime behaviour changed). Any client that cached the old ABI must reload.
+
+---
+
+## Phase 4 — Backend Module System: ESM Change Reverted, Parallel-Copy Approach Adopted
+
+### What happened
+
+During Phase 4 test tooling work, `backend/package.json` was changed from
+`"type": "commonjs"` to `"type": "module"` and `backend/tsconfig.json` was
+changed from `"module": "CommonJS"` to `"module": "NodeNext"` (with
+`"moduleResolution": "NodeNext"` added). The intent was to allow Hardhat's
+ESM-based Mocha runner to import `backend/consensusSimulation.ts` and
+`backend/waitFreeRegister.ts` from the root-level test files without a
+`SyntaxError: Unexpected token 'export'` error.
+
+This change was validated only by running `npx hardhat test`. The actual backend
+server was never started after the change was made.
+
+### Why the ESM change was reverted
+
+Actually running the dev server (`cd backend && npx ts-node --esm server.ts`)
+failed immediately with:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../backend/blockchain'
+```
+
+The cause: all relative imports in `backend/server.ts` (e.g. `"./blockchain"`,
+`"./encryption"`, `"./waitFreeRegister"`) lack the explicit `.js` extensions
+that NodeNext ESM resolution requires. Additionally, `backend/blockchain.ts`
+uses `__dirname`, which does not exist in ESM. Fixing both would have required
+changes to every file in the backend — a broad, risky change to a codebase
+built and tested across three prior phases under CommonJS.
+
+The ESM change was therefore fully reverted:
+- `backend/package.json` — `"type": "commonjs"` removed entirely (Node defaults
+  to CJS when the field is absent; runtime behaviour is identical)
+- `backend/tsconfig.json` — reverted to `"module": "CommonJS"`,
+  `"moduleResolution": "Node"`, `rootDir` removed so TypeScript can follow
+  imports into `../shared/` without a TS6059 error while keeping `outDir: ./dist`
+  and the `dist/server.js` output path intact
+- `backend/package.json` start script — reverted to `ts-node server.ts`
+
+### Why re-exports from shared/ also failed
+
+A re-export approach was attempted in both directions:
+
+1. `backend/` re-exporting from `shared/` — failed at runtime with
+   `ERR_REQUIRE_ESM`: `ts-node` (CJS mode) cannot `require()` a file whose
+   nearest `package.json` has `"type": "module"`.
+2. `shared/` re-exporting from `backend/` — failed with
+   `ERR_REQUIRE_CYCLE_MODULE` on Node 24: the ESM loader refuses to
+   `require()` a CJS file in a cycle when the call originates from an ESM
+   context.
+
+Both directions hit the same fundamental Node 24 constraint: no cross-package
+import between the ESM root package and the CJS `backend/` sub-package works
+in either direction, regardless of which side holds the implementation.
+
+### The actual fix: parallel standalone copies
+
+The only approach that satisfies all three constraints simultaneously —
+(a) tests import from the ESM root package context,
+(b) backend server loads its own files under CJS without any cross-package
+    import, and
+(c) no file in `backend/` is modified beyond what is strictly necessary —
+is to keep fully independent copies in both locations:
+
+- `shared/consensusSimulation.ts` — full standalone implementation, ESM root
+  package, imported by `test/consensusSimulation.test.ts`
+- `shared/waitFreeRegister.ts` — full standalone implementation, ESM root
+  package, imported by `test/waitFreeRegister.test.ts`
+- `backend/consensusSimulation.ts` — full standalone implementation, CJS,
+  imported by `backend/server.ts` (unchanged import path)
+- `backend/waitFreeRegister.ts` — full standalone implementation, CJS,
+  imported by `backend/server.ts` (unchanged import path)
+
+The two pairs are identical in content. There is no technical coupling between
+them — keeping them in sync is a maintenance contract, not an enforced
+dependency. Both files are pure logic with zero imports, so drift is unlikely
+in practice.
+
+A secondary bug was also found and fixed during this work: `backend/blockchain.ts`
+had `path.join(__dirname, "..", "..", "artifacts", ...)` which resolved correctly
+from `backend/dist/` (compiled) but resolved two levels too high from `backend/`
+(ts-node), landing at the Desktop instead of the project root. Fixed with a
+`findAbiPath()` helper that probes one level up first, then two, handling both
+contexts correctly.
+
+### Verified state — all three checks run and confirmed
+
+- `cd backend && npx ts-node server.ts` — all modules load cleanly under CJS,
+  ABI found, 17 env vars loaded, reaches `initializeDatabase()`, fails only on
+  the Aiven PostgreSQL host being unreachable locally (not a code issue)
+- `cd backend && npm run build` — `tsc` compiles with zero errors; one
+  pre-existing type gap also fixed (`revoked` field missing from `createHospital`
+  return value in `dbPostgres.ts`)
+- `cd backend && node dist/server.js` — compiled output loads all modules,
+  reaches `initializeDatabase()`, same Aiven network error — not a code issue
+- `npx hardhat test` — 37 tests passing
+
+The backend's module system is confirmed unchanged from Phases 1–3. The test
+tooling change is an isolated addition that does not affect the runtime behaviour
+of the Express server in either dev or production mode.

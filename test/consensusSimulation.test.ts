@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import simulateConsensus from "../backend/consensusSimulation";
+import simulateConsensus from "../shared/consensusSimulation.js";
 
 describe("simulateConsensus (backend)", function () {
   // n=5, f=1 throughout — matching the HIE system's configured parameters.

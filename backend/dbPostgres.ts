@@ -223,7 +223,7 @@ export async function createHospital(name: string, email: string, plain: string)
       "INSERT INTO hospitals (name, email, password_hash, password_history, verified) VALUES ($1, $2, $3, $4, $5)",
       [name, email.toLowerCase(), passwordHash, [], false]
     );
-    return { name, email: email.toLowerCase(), passwordHash, passwordHistory: [], verified: false };
+    return { name, email: email.toLowerCase(), passwordHash, passwordHistory: [], verified: false, revoked: false };
   } finally {
     client.release();
   }
