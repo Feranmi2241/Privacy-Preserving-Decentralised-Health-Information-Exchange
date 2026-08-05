@@ -115,11 +115,11 @@ function LoginPage({ form, set, loading, error, info, handle, nav }: LoginProps)
 
           <div className="login-left-mid">
             <h2 className="login-left-headline">
-              The Immutable <br /> Sanctuary.
+             	Clinical Ledger for Health <br> Information Exchange
             </h2>
             <p className="login-left-sub">
-              Access the world's most secure decentralized healthcare infrastructure.
-              Every record, every node, verified forever.
+              A blockchain-based health information exchange with patient-controlled,
+               per-hospital access.
             </p>
           </div>
 

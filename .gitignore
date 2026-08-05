@@ -19,3 +19,11 @@
 
 # Hardhat coverage reports
 /coverage
+
+q-dev-chat*.md
+
+/q-dev-chat*.md
+
+artifacts/
+
+ 
