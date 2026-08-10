@@ -256,3 +256,64 @@ contexts correctly.
 The backend's module system is confirmed unchanged from Phases 1–3. The test
 tooling change is an isolated addition that does not affect the runtime behaviour
 of the Express server in either dev or production mode.
+
+---
+
+## Phase 5 — Sepolia Redeploy: Phase 3 Security Fixes Brought Live
+
+### What happened
+
+Phase 3 made three security-significant changes to the contract (view functions,
+`grantConsent` restricted to `onlyOwner`, `RecordAccessed` event removed) and
+wrote tests for all of them. However, the actual contract deployed on Sepolia was
+never updated at the time — the live app continued pointing at the old Phase 2
+address throughout Phases 3 and 4, meaning none of Phase 3's on-chain security
+fixes were active in production. This phase redeploys the current contract code
+and updates every address reference so the live system finally matches what was
+built.
+
+### Addresses
+
+| | Address |
+|---|---|
+| Old contract (Phase 2 / Phase 3 era) | `0xd2CEAC3c11CA939c0524Db10AF18285F96Abf9Bc` |
+| New contract (this redeploy) | `0x0B38aE34a6366590bb81721e79a5429F35CDbbEd` |
+
+Network: Sepolia testnet. Date: 2025-07-10.
+
+### Files updated
+
+- `backend/.env` — `CONTRACT_ADDRESS` updated to new address; `RPC_URL` updated
+  from local Ganache (`http://127.0.0.1:7545`) to the Sepolia Alchemy endpoint
+  (the backend was pointing at a local node that no longer holds the contract)
+- `frontend/.env` — `VITE_CONTRACT_ADDRESS` updated to new address
+- Render and Vercel dashboard env vars — require manual update (cannot be
+  updated by a local script); flagged as explicit manual steps
+
+### The migration boundary
+
+**All hospital wallet authorizations are reset.** The new contract's constructor
+auto-authorizes only the deployer wallet. Every hospital account that previously
+completed the wallet-link flow against the old contract address
+(`0xd2CEAC3c11CA939c0524Db10AF18285F96Abf9Bc`) is not authorized on the new one,
+even though their account still exists in Postgres with a `wallet_address` on
+file. Each affected hospital must either redo the wallet-connect step from the
+frontend dashboard (which calls `authorizeHospital` as part of that flow), or
+the owner wallet must call `authorizeHospital(walletAddress)` directly via the
+one-off script at `scripts/authorizeHospitals.ts`.
+
+**All patient records stored under the old contract address are not migrated and
+are no longer reachable through the app.** The IPFS payloads still exist on
+Pinata and can be fetched directly by CID, but the on-chain index
+(`records[patientId]` mapping) lives inside the old contract at
+`0xd2CEAC3c11CA939c0524Db10AF18285F96Abf9Bc`. The new contract at
+`0x0B38aE34a6366590bb81721e79a5429F35CDbbEd` has an empty records mapping.
+Any call to `getRecord`, `getIpfsHash`, or `getRecordCount` for a patient ID
+that was stored under the old contract will revert with `"Record not found"`.
+This is the same kind of explicit boundary established in Phase 3's migration
+note — the old data is not lost from IPFS, but it is unreachable through the
+application without pointing back at the old contract address.
+
+This is a known, intentional limitation. All pre-redeploy records are test data
+in a research-stage deployment. The decision is documented here so the empty
+record state after redeploy is an explained boundary rather than a mystery bug.

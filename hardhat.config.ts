@@ -3,6 +3,7 @@ import { configVariable, defineConfig } from "hardhat/config";
 
 export default defineConfig({
   plugins: [hardhatToolboxMochaEthersPlugin],
+  defaultNetwork: "hardhatMainnet",
   paths: {
     sources: "./contracts",
     artifacts: "./artifacts",
