@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Ping backend health check
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" https://health-blockchain-hie.onrender.com/)
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://privacy-preserving-decentralised-health.onrender.com/)
           echo "Health check responded with status $response"
           if [ "$response" -ne 200 ]; then
             echo "::warning::Health check did not return 200 (got $response) — backend or database may still be waking up, this is not necessarily a failure on the first ping after a long idle period."
