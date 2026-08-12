@@ -611,6 +611,16 @@ export async function consumeRevokeToken(
   } finally { client.release(); }
 }
 
+// ── Keep-alive health check ──────────────────────────────────────────────────
+export async function checkDbConnection(): Promise<boolean> {
+  try {
+    await pool.query("SELECT 1");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 export async function closeDatabase(): Promise<void> {
   await pool.end();

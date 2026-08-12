@@ -1,0 +1,18 @@
+name: Keep Backend and Database Awake
+
+on:
+  schedule:
+    - cron: "0 */60 * * *"   # every 60 hours (~2.5 days) — comfortably inside both platforms' inactivity windows
+  workflow_dispatch:          # allows manually triggering a run from the Actions tab, useful for testing this immediately
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend health check
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://health-blockchain-hie.onrender.com/)
+          echo "Health check responded with status $response"
+          if [ "$response" -ne 200 ]; then
+            echo "::warning::Health check did not return 200 (got $response) — backend or database may still be waking up, this is not necessarily a failure on the first ping after a long idle period."
+          fi

@@ -64,6 +64,7 @@ import {
   createPendingSubmission, completePendingSubmission,
   cancelPendingSubmission, expireStaleSubmissions,
   createRevokeToken, consumeRevokeToken,
+  checkDbConnection,
 } from "./dbPostgres";
 import {
   sendSignupOTP, sendForgotOTP, sendRecordStoredNotification,
@@ -120,10 +121,16 @@ const accessLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many access requests. Please wait before retrying." },
 });
+const healthLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, max: 30,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many health check requests. Please slow down." },
+});
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "Clinical Ledger HIE Backend" });
+app.get("/", healthLimiter, async (_req: Request, res: Response) => {
+  const dbOk = await checkDbConnection();
+  res.json({ status: "ok", service: "Clinical Ledger HIE Backend", database: dbOk ? "connected" : "unreachable" });
 });
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
