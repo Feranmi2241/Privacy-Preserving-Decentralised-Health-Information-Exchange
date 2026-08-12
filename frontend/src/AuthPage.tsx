@@ -115,7 +115,7 @@ function LoginPage({ form, set, loading, error, info, handle, nav }: LoginProps)
 
           <div className="login-left-mid">
             <h2 className="login-left-headline">
-             	Clinical Ledger for Health <br> Information Exchange
+             	Clinical Ledger for Health <br /> Information Exchange
             </h2>
             <p className="login-left-sub">
               A blockchain-based health information exchange with patient-controlled,
