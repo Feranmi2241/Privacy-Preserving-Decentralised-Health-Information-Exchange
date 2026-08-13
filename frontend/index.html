@@ -10,15 +10,17 @@
       infrastructure allows it later — a meta tag can theoretically be stripped by a
       compromised page before it takes effect, which is not possible with a real header.
 
-      connect-src is intentionally limited to the two origins this page's own fetch()
-      calls directly: the backend API and the Pinata IPFS gateway. The Sepolia RPC
-      provider is deliberately excluded — window.ethereum.request() is handled by the
-      MetaMask extension's isolated context and never goes through the page's own
-      fetch/XHR, so connect-src does not govern it and adding it would grant an
-      unnecessary permission to a channel this page never uses directly.
-
-      IMPORTANT: update connect-src when VITE_API_URL or VITE_PINATA_GATEWAY change
-      for production deployment.
+      connect-src lists every origin this page's own fetch() calls directly:
+        - https://privacy-preserving-decentralised-health.onrender.com — the production
+          backend API (VITE_API_URL in Vercel's environment variables)
+        - https://*.mypinata.cloud — Pinata IPFS gateway (VITE_IPFS_GATEWAY_1)
+        - https://ipfs.io, https://dweb.link, https://w3s.link, https://4everland.io —
+          the four public IPFS gateways used alongside Pinata for Phase 4's k-set
+          Byzantine consensus check (VITE_IPFS_GATEWAY_2 through _5)
+      The Sepolia RPC provider is deliberately excluded — window.ethereum.request() is
+      handled by the MetaMask extension's isolated context and never goes through the
+      page's own fetch/XHR, so connect-src does not govern it and adding it would grant
+      an unnecessary permission to a channel this page never uses directly.
     -->
     <meta http-equiv="Content-Security-Policy" content="
       default-src 'self';
@@ -26,7 +28,7 @@
       style-src   'self' 'unsafe-inline' https://fonts.googleapis.com;
       font-src    'self' https://fonts.gstatic.com;
       img-src     'self' data: blob:;
-      connect-src 'self' http://localhost:5000 https://*.mypinata.cloud;
+      connect-src 'self' https://privacy-preserving-decentralised-health.onrender.com https://*.mypinata.cloud https://ipfs.io https://dweb.link https://w3s.link https://4everland.io;
       object-src  'none';
       frame-src   'none';
     " />
