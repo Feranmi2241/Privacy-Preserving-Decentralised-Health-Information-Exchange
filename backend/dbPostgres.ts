@@ -72,6 +72,9 @@ export async function initializeDatabase(): Promise<void> {
         revoked BOOLEAN DEFAULT FALSE
       )
     `);
+    await client.query(`ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS rsa_public_key TEXT;`);
+    await client.query(`ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(42);`);
+    await client.query(`ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE;`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS patient_emails (
@@ -122,6 +125,7 @@ export async function initializeDatabase(): Promise<void> {
         created_at BIGINT NOT NULL
       )
     `);
+    await client.query(`ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS hospital_email_hash VARCHAR(64);`);
 
     console.log("[DB] Tables ready");
   } catch (error) {
