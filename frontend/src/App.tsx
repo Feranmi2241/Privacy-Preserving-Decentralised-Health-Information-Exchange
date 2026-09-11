@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import AuthPage from './AuthPage';
 import PatientForm from './PatientForm';
 import RecordViewer from './RecordViewer';
+import { connectWallet } from './utils/connectWallet';
 import './index.css';
 import './dashboard.css';
 
@@ -193,22 +194,24 @@ export default function App() {
   const [token, setToken]               = useState(() => sessionStorage.getItem('cl_token') || '');
   const [hospitalName, setHospitalName] = useState(() => sessionStorage.getItem('cl_hospital') || '');
   const [hospitalEmail, setHospitalEmail] = useState(() => sessionStorage.getItem('cl_email') || '');
-  // rsaKey is intentionally kept in plain React state only — never written to
-  // localStorage or sessionStorage. handleSignOut clears it alongside the token,
-  // so it is always wiped on logout. Do not add any persistence for this value.
   const [rsaKey, setRsaKey]             = useState('');
+  const [hasWallet, setHasWallet]       = useState(true);
+  const [walletBannerLoading, setWalletBannerLoading] = useState(false);
+  const [walletBannerError, setWalletBannerError]     = useState('');
   const [tab, setTab]                   = useState<Tab>('add');
   const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [network, setNetwork]           = useState<NetworkStatus | null>(null);
   const [recentIds, setRecentIds]       = useState<string[]>([]);
 
-  const handleAuth = (t: string, h: string, rsa: string, e: string) => {
+  const handleAuth = (t: string, h: string, rsa: string, e: string, hw: boolean = true) => {
     sessionStorage.setItem('cl_token', t);
     sessionStorage.setItem('cl_hospital', h);
     sessionStorage.setItem('cl_email', e);
     setToken(t);
     setHospitalName(h);
     setHospitalEmail(e);
+    setHasWallet(hw);
+    setWalletBannerError('');
     if (rsa) setRsaKey(rsa);
   };
 
@@ -220,6 +223,8 @@ export default function App() {
     setHospitalName('');
     setHospitalEmail('');
     setRsaKey('');
+    setHasWallet(true);
+    setWalletBannerError('');
   };
 
   // Fetch real network status from blockchain
@@ -251,6 +256,19 @@ export default function App() {
     const id = setInterval(() => { fetchNetwork(); fetchRecentIds(); }, 30_000);
     return () => clearInterval(id);
   }, [fetchNetwork, fetchRecentIds]);
+
+  const handleConnectWalletBanner = async () => {
+    setWalletBannerLoading(true);
+    setWalletBannerError('');
+    try {
+      await connectWallet({ token, email: hospitalEmail });
+      setHasWallet(true);
+    } catch (err: any) {
+      setWalletBannerError(err.message || 'An unexpected error occurred');
+    } finally {
+      setWalletBannerLoading(false);
+    }
+  };
 
   if (!token) {
     return <AuthPage onAuth={handleAuth} />;
@@ -303,6 +321,49 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        {/* Wallet missing banner — persistent, not dismissible */}
+        {!hasWallet && (
+          <div style={{
+            margin: '0 0 0 0',
+            padding: '16px 24px',
+            background: 'linear-gradient(90deg, rgba(180,83,9,0.12) 0%, rgba(234,179,8,0.10) 100%)',
+            borderBottom: '2px solid rgba(234,179,8,0.45)',
+            display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+          }}>
+            <span className="material-symbols-outlined" style={{ fontSize: 28, color: '#b45309', flexShrink: 0 }}>account_balance_wallet</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <p style={{ fontWeight: 700, fontSize: '0.95rem', color: '#92400e', marginBottom: 2 }}>
+                Wallet not connected — you cannot add records yet.
+              </p>
+              <p style={{ fontSize: '0.82rem', color: '#78350f', lineHeight: 1.5 }}>
+                Your account doesn't have a wallet connected yet. You won't be able to add new records until this is done.
+              </p>
+              {walletBannerError && (
+                <p style={{ fontSize: '0.82rem', color: '#b91c1c', marginTop: 6 }}>
+                  ⚠️ {walletBannerError}
+                </p>
+              )}
+            </div>
+            <button
+              onClick={handleConnectWalletBanner}
+              disabled={walletBannerLoading}
+              style={{
+                padding: '10px 20px', borderRadius: 10, border: 'none',
+                background: walletBannerLoading ? 'rgba(180,83,9,0.4)' : '#b45309',
+                color: '#fff', fontWeight: 700, fontSize: '0.875rem',
+                cursor: walletBannerLoading ? 'not-allowed' : 'pointer',
+                display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {walletBannerLoading
+                ? <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Connecting...</>
+                : <><span className="material-symbols-outlined" style={{ fontSize: 18 }}>account_balance_wallet</span> Connect Wallet Now</>
+              }
+            </button>
+          </div>
+        )}
 
         {/* Dashboard content */}
         <div className="ds-content ds-fade-in">

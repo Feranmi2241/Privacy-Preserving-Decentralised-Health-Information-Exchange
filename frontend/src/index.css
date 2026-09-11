@@ -417,3 +417,148 @@ body {
   font-family: 'Courier New', monospace;
   letter-spacing: 0.02em;
 }
+
+/* ══════════════════════════════════════════
+   RESPONSIVE — All breakpoints
+   Touch nothing above this line.
+   Only layout / sizing / spacing overrides.
+══════════════════════════════════════════ */
+
+/* ── Tablet / large phone (≤ 767px) ── */
+@media (max-width: 767px) {
+  .app-wrapper { padding: 20px 12px 60px; }
+
+  .card { padding: 20px; border-radius: 12px; }
+  .card-title { font-size: 1rem; }
+
+  .form-group { margin-bottom: 16px; }
+  .form-group label { font-size: 0.75rem; }
+  .form-group input,
+  .form-group textarea { padding: 10px 12px; font-size: 0.85rem; }
+  .form-group textarea { min-height: 90px; }
+
+  .btn { padding: 11px; font-size: 0.85rem; }
+
+  .record-header { padding: 14px 16px; gap: 10px; flex-wrap: wrap; }
+  .record-header-info h3 { font-size: 0.9rem; }
+  .record-body { padding: 16px; }
+  .record-field { padding: 10px 0; }
+  .field-value { font-size: 0.85rem; }
+  .field-value.diagnosis { font-size: 0.875rem; padding: 8px 10px; }
+
+  .alert { padding: 10px 12px; font-size: 0.8rem; }
+  .alert-body code { font-size: 0.7rem; }
+}
+
+/* ── Mobile (≤ 599px) ── */
+@media (max-width: 599px) {
+  .app-wrapper { padding: 12px 8px 48px; }
+
+  .card { padding: 14px; border-radius: 10px; }
+  .card-title { font-size: 0.95rem; }
+  .card-subtitle { font-size: 0.75rem; margin-bottom: 20px; }
+
+  .form-group { margin-bottom: 14px; }
+  .form-group label { font-size: 0.72rem; margin-bottom: 5px; }
+  .form-group input,
+  .form-group textarea { padding: 9px 10px; font-size: 0.82rem; border-radius: 8px; }
+  .form-group textarea { min-height: 80px; }
+
+  .btn { padding: 10px; font-size: 0.82rem; border-radius: 8px; }
+
+  .record-header { padding: 12px 14px; }
+  .record-avatar { width: 36px; height: 36px; font-size: 16px; }
+  .record-header-info h3 { font-size: 0.85rem; }
+  .record-header-info span { font-size: 0.72rem; }
+  .record-body { padding: 12px; }
+  .record-field { padding: 8px 0; }
+  .field-label { font-size: 0.68rem; }
+  .field-value { font-size: 0.82rem; }
+  .field-value.mono { font-size: 0.7rem; }
+  .field-value.diagnosis { font-size: 0.82rem; padding: 7px 9px; }
+
+  .badge { padding: 2px 8px; font-size: 0.68rem; }
+
+  .alert { padding: 9px 10px; font-size: 0.78rem; gap: 8px; }
+  .alert-body code { font-size: 0.68rem; word-break: break-all; }
+
+  /* Tabs */
+  .tabs { padding: 4px; gap: 2px; }
+  .tab-btn { padding: 8px 0; font-size: 0.78rem; gap: 4px; }
+}
+
+/* ── Small mobile (≤ 479px) ── */
+@media (max-width: 479px) {
+  .app-wrapper { padding: 8px 6px 40px; }
+
+  .card { padding: 10px; border-radius: 8px; }
+  .card-title { font-size: 0.875rem; }
+
+  .form-group { margin-bottom: 12px; }
+  .form-group input,
+  .form-group textarea { padding: 8px 9px; font-size: 0.8rem; }
+
+  .btn { padding: 9px; font-size: 0.8rem; }
+
+  .record-header { padding: 10px 12px; gap: 8px; }
+  .record-body { padding: 10px; }
+  .field-value.diagnosis { font-size: 0.78rem; }
+
+  /* Error alert — long hex strings must wrap */
+  .alert-body code {
+    word-break: break-all;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .alert { flex-direction: row; align-items: flex-start; }
+}
+
+/* ── Ensure long error strings never overflow the card on any size ── */
+.alert-body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.alert-body code {
+  display: block;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+/* ── PatientForm header banner: the inline-styled gradient header
+   inside the card uses hardcoded padding: '28px 32px 24px'.
+   We override it at small sizes via the card's first child. ── */
+@media (max-width: 767px) {
+  .card > div:first-child { padding: 20px 20px 18px !important; }
+}
+@media (max-width: 599px) {
+  .card > div:first-child { padding: 16px 14px 14px !important; }
+}
+@media (max-width: 479px) {
+  .card > div:first-child { padding: 12px 12px 12px !important; }
+}
+
+/* ── PatientForm inner content area: padding: '0 32px 32px' inline ── */
+@media (max-width: 767px) {
+  .card > div:last-child { padding: 0 16px 20px !important; }
+}
+@media (max-width: 599px) {
+  .card > div:last-child { padding: 0 10px 16px !important; }
+}
+@media (max-width: 479px) {
+  .card > div:last-child { padding: 0 8px 12px !important; }
+}
+
+/* ── RecordViewer: record-header flex wrap on small screens ── */
+@media (max-width: 599px) {
+  .record-header { flex-wrap: wrap; }
+  .record-header > div:last-child {
+    margin-left: 0 !important;
+    width: 100%;
+    flex-direction: row !important;
+    justify-content: flex-start !important;
+    gap: 8px !important;
+    flex-wrap: wrap;
+  }
+}

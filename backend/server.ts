@@ -210,7 +210,8 @@ app.post("/auth/login", authLimiter, async (req: Request, res: Response) => {
     res.status(403).json({ error: "Email not verified" }); return;
   }
   const token = signToken(email, hospital.name);
-  res.json({ token, hospitalName: hospital.name });
+  const walletAddress = await getHospitalWalletAddress(email);
+  res.json({ token, hospitalName: hospital.name, hasWallet: Boolean(walletAddress) });
 });
 
 // ── POST /auth/forgot-password ────────────────────────────────────────────────

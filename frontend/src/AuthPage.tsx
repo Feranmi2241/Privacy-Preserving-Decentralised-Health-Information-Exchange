@@ -1,5 +1,6 @@
 ﻿import { useState } from 'react';
 import './AuthPage.css';
+import { connectWallet } from './utils/connectWallet';
 
 declare global {
   interface Window {
@@ -9,7 +10,7 @@ declare global {
 
 type AuthStep = 'login' | 'register' | 'verify-otp' | 'forgot' | 'reset-password' | 'connect-wallet';
 
-interface Props { onAuth: (token: string, hospitalName: string, rsaKey: string, email: string) => void; }
+interface Props { onAuth: (token: string, hospitalName: string, rsaKey: string, email: string, hasWallet: boolean) => void; }
 
 const API = import.meta.env.VITE_API_URL;
 
@@ -278,7 +279,7 @@ export default function AuthPage({ onAuth }: Props) {
     try {
       if (step === 'login') {
         const data = await post('/auth/login', { email: form.email, password: form.password });
-        onAuth(data.token, data.hospitalName, '', form.email);
+        onAuth(data.token, data.hospitalName, '', form.email, Boolean(data.hasWallet));
 
       } else if (step === 'register') {
         if (!form.termsAccepted) {
@@ -329,84 +330,11 @@ export default function AuthPage({ onAuth }: Props) {
     }
   };
 
-  const connectWallet = async () => {
+  const handleConnectWallet = async () => {
     setLoading(true); setError(''); setInfo('');
     try {
-      // Point 1 — check MetaMask exists
-      if (!window.ethereum) {
-        setError('MetaMask (or another Ethereum wallet browser extension) is required to continue. Install it at https://metamask.io');
-        return;
-      }
-
-      // Point 2 — request accounts
-      const accounts: string[] = await window.ethereum.request({ method: 'eth_requestAccounts' });
-      const walletAddress = accounts[0];
-      if (!walletAddress) {
-        setError('No account found. Please unlock MetaMask and try again.');
-        return;
-      }
-
-      // Point 3 — verify Sepolia network
-      const chainId: string = await window.ethereum.request({ method: 'eth_chainId' });
-      if (chainId !== '0xaa36a7') {
-        try {
-          await window.ethereum.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: '0xaa36a7' }],
-          });
-        } catch (switchErr: any) {
-          if (switchErr.code === 4001) {
-            setError('You must switch to the Sepolia test network to continue.');
-          } else {
-            setError('Failed to switch network: ' + (switchErr.message || 'Unknown error'));
-          }
-          return;
-        }
-      }
-
-      // Point 4 — get nonce message from backend
-      const token = sessionStorage.getItem('cl_token');
-      const nonceRes = await fetch(`${API}/auth/wallet-nonce`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ email: pendingEmail }),
-      });
-      const nonceData = await nonceRes.json();
-      if (!nonceRes.ok) throw new Error(nonceData.error || 'Failed to get nonce');
-      const message: string = nonceData.message;
-
-      // Point 5 — sign the message (no gas, just a signature prompt)
-      const { BrowserProvider } = await import('ethers');
-      const provider = new BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-      let signature: string;
-      try {
-        signature = await signer.signMessage(message);
-      } catch (signErr: any) {
-        if (signErr.code === 4001 || signErr.code === 'ACTION_REJECTED') {
-          setError('Signature rejected. You must sign the message to link your wallet.');
-        } else {
-          setError('Signing failed: ' + (signErr.message || 'Unknown error'));
-        }
-        return;
-      }
-
-      // Point 6 — verify signature on backend
-      const verifyRes = await fetch(`${API}/auth/wallet-verify`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ email: pendingEmail, walletAddress, signature }),
-      });
-      const verifyData = await verifyRes.json();
-      if (!verifyRes.ok) throw new Error(verifyData.error || 'Wallet verification failed');
-
-      // Point 7 — success
+      const token = sessionStorage.getItem('cl_token') || '';
+      await connectWallet({ token, email: pendingEmail });
       setInfo('Wallet connected! You can now log in.');
       setStep('login');
     } catch (err: any) {
@@ -521,7 +449,7 @@ export default function AuthPage({ onAuth }: Props) {
               <button
                 type="button"
                 className="cl-btn-primary"
-                onClick={connectWallet}
+                onClick={handleConnectWallet}
                 disabled={loading}
               >
                 {loading ? (
