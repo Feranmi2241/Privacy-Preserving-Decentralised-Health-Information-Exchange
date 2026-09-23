@@ -22,10 +22,12 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.19.19",
     "chai": "^6.2.2",
-    "ethers": "^6.16.0",
+    "dotenv": "^17.4.2",
+    "ethers": "^6.17.0",
     "forge-std": "github:foundry-rs/forge-std#v1.9.4",
     "hardhat": "^3.1.12",
     "mocha": "^11.7.5",
+    "pg": "^8.23.0",
     "typescript": "~5.8.0"
   }
 }

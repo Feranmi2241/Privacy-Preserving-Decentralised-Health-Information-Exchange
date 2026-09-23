@@ -13,6 +13,9 @@
 
 import * as dotenv from "dotenv";
 import * as path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Load backend/.env so RPC_URL, PRIVATE_KEY, CONTRACT_ADDRESS, DATABASE_URL are all available
 dotenv.config({ path: path.join(__dirname, "..", "backend", ".env") });
