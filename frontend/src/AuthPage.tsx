@@ -210,6 +210,17 @@ function LoginPage({ form, set, loading, error, info, handle, nav }: LoginProps)
               <div className="cl-alert cl-alert-error">
                 <span className="material-symbols-outlined cl-alert-icon">error</span>
                 <span>{error}</span>
+                {unverifiedEmail && (
+                  <button
+                    type="button"
+                    className="cl-link"
+                    style={{ marginLeft: 8, whiteSpace: 'nowrap' }}
+                    onClick={handleResendOtp}
+                    disabled={loading}
+                  >
+                    Resend verification code
+                  </button>
+                )}
               </div>
             )}
             {info && (
@@ -257,6 +268,7 @@ export default function AuthPage({ onAuth }: Props) {
   const [keyCopied, setKeyCopied]         = useState(false);
   const [keyAcknowledged, setKeyAcknowledged] = useState(false);
   const [showKeyModal, setShowKeyModal]   = useState(false);
+  const [unverifiedEmail, setUnverifiedEmail] = useState('');
 
   const set = (k: string, v: string | boolean) => {
     setForm(f => ({ ...f, [k]: v }));
@@ -278,6 +290,7 @@ export default function AuthPage({ onAuth }: Props) {
     setLoading(true); setError(''); setInfo('');
     try {
       if (step === 'login') {
+        setUnverifiedEmail('');
         const data = await post('/auth/login', { email: form.email, password: form.password });
         onAuth(data.token, data.hospitalName, '', form.email, Boolean(data.hasWallet));
 
@@ -324,6 +337,9 @@ export default function AuthPage({ onAuth }: Props) {
         setStep('login');
       }
     } catch (err: any) {
+      if (step === 'login' && err.message === 'Email not verified') {
+        setUnverifiedEmail(form.email);
+      }
       setError(err.message);
     } finally {
       setLoading(false);
@@ -344,7 +360,22 @@ export default function AuthPage({ onAuth }: Props) {
     }
   };
 
-  const nav = (s: AuthStep) => { setStep(s); setError(''); setInfo(''); };
+  const nav = (s: AuthStep) => { setStep(s); setError(''); setInfo(''); setUnverifiedEmail(''); };
+
+  const handleResendOtp = async () => {
+    setLoading(true); setError(''); setInfo('');
+    try {
+      await post('/auth/resend-otp', { email: unverifiedEmail });
+      setForm(f => ({ ...f, email: unverifiedEmail, code: '' }));
+      setUnverifiedEmail('');
+      setInfo('A new verification code has been sent to your email.');
+      setStep('verify-otp');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   /* ── RSA Key Modal ── */
   if (showKeyModal) {

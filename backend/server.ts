@@ -168,8 +168,17 @@ app.post("/auth/register", authLimiter, async (req: Request, res: Response) => {
   if (!STRONG_PASSWORD_REGEX.test(password)) {
     res.status(400).json({ error: "Password must be ≥8 chars with upper, lower, digit and special character" }); return;
   }
-  if (await findHospital(email)) {
-    res.status(409).json({ error: "Email already registered" }); return;
+  const existing = await findHospital(email);
+  if (existing) {
+    if (existing.verified) {
+      res.status(409).json({ error: "Email already registered" }); return;
+    }
+    // Unverified account — resend a fresh OTP instead of dead-ending
+    const code = generateOTP();
+    await storeOTP(email, code, "signup");
+    try { await sendSignupOTP(email, code); } catch (e: any) { console.warn("[mailer]", e.message); }
+    res.json({ message: "OTP sent to email", resent: true });
+    return;
   }
   await createHospital(name, email, password);
   const code = generateOTP();
@@ -199,6 +208,25 @@ app.post("/auth/verify-otp", otpLimiter, async (req: Request, res: Response) => 
     keyWarning:   "Save this private key somewhere safe right now — it will never be shown again, and you will need it to view any patient record you're given access to.",
   });
 });
+// ── POST /auth/resend-otp ────────────────────────────────────────────────────
+app.post("/auth/resend-otp", otpLimiter, async (req: Request, res: Response) => {
+  const { email } = req.body;
+  if (!email) { res.status(400).json({ error: "Email is required" }); return; }
+  const hospital = await findHospital(email);
+  if (!hospital) { res.status(404).json({ error: "No account found for this email" }); return; }
+  if (hospital.verified) { res.status(400).json({ error: "This email is already verified — please log in instead" }); return; }
+  const code = generateOTP();
+  await storeOTP(email, code, "signup");
+  try {
+    await sendSignupOTP(email, code);
+  } catch (e: any) {
+    console.warn("[mailer]", e.message);
+    res.status(502).json({ error: "Could not send the verification email right now. Please try again in a moment." });
+    return;
+  }
+  res.json({ message: "A new OTP has been sent to your email" });
+});
+
 // ── POST /auth/login ──────────────────────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req: Request, res: Response) => {
   const { email, password } = req.body;
