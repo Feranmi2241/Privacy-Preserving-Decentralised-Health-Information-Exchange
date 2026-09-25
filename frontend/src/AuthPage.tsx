@@ -1,4 +1,4 @@
-﻿import { useState } from 'react';
+import { useState } from 'react';
 import './AuthPage.css';
 import { connectWallet } from './utils/connectWallet';
 
@@ -94,9 +94,11 @@ interface LoginProps {
   info: string;
   handle: (e: React.FormEvent) => void;
   nav: (s: AuthStep) => void;
+  unverifiedEmail: string;
+  onResendOtp: () => void;
 }
 
-function LoginPage({ form, set, loading, error, info, handle, nav }: LoginProps) {
+function LoginPage({ form, set, loading, error, info, handle, nav, unverifiedEmail, onResendOtp }: LoginProps) {
   return (
     <div className="login-shell">
       <div className="login-blob-tl" />
@@ -215,7 +217,7 @@ function LoginPage({ form, set, loading, error, info, handle, nav }: LoginProps)
                     type="button"
                     className="cl-link"
                     style={{ marginLeft: 8, whiteSpace: 'nowrap' }}
-                    onClick={handleResendOtp}
+                    onClick={onResendOtp}
                     disabled={loading}
                   >
                     Resend verification code
@@ -435,6 +437,8 @@ export default function AuthPage({ onAuth }: Props) {
         form={form} set={set}
         loading={loading} error={error} info={info}
         handle={handle} nav={nav}
+        unverifiedEmail={unverifiedEmail}
+        onResendOtp={handleResendOtp}
       />
     );
   }
